@@ -8,7 +8,6 @@ from dataclasses import field
 from .converters import ValidationError
 from .exceptions import DuplicateRuleError
 from .exceptions import NoMatch
-from .exceptions import RequestAliasRedirect
 from .exceptions import RequestPath
 from .rules import Rule
 from .rules import RulePart
@@ -176,18 +175,7 @@ class StateMachineMatcher:
         except SlashRequired:
             raise RequestPath(f"{path}/") from None
 
-        if self.merge_slashes and rv is None:
-            # Try to match again, but with slashes merged
-            path = re.sub("/{2,}", "/", path)
-            try:
-                rv = _match(self._root, [domain, *path.split("/")], [])
-            except SlashRequired:
-                raise RequestPath(f"{path}/") from None
-            if rv is None or rv[0].merge_slashes is False:
-                raise NoMatch(have_match_for, websocket_mismatch)
-            else:
-                raise RequestPath(f"{path}")
-        elif rv is not None:
+        if rv is not None:
             rule, values = rv
 
             result = {}
@@ -199,9 +187,6 @@ class StateMachineMatcher:
                 result[str(name)] = value
             if rule.defaults:
                 result.update(rule.defaults)
-
-            if rule.alias and rule.map.redirect_defaults:
-                raise RequestAliasRedirect(result, rule.endpoint)
 
             return rule, result
 

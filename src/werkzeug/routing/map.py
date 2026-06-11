@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import typing as t
 import warnings
 from pprint import pformat
@@ -643,7 +644,9 @@ class MapAdapter:
         path_part = f"/{path_info.lstrip('/')}" if path_info else ""
 
         try:
-            result = self.map._matcher.match(domain_part, path_part, method, websocket)
+            rule, rv = self.map._matcher.match(
+                domain_part, path_part, method, websocket
+            )
         except RequestPath as e:
             # safe = https://url.spec.whatwg.org/#url-path-segment-string
             new_path = quote(e.path_info, safe="!$&'()*+,/:;=@")
@@ -661,15 +664,78 @@ class MapAdapter:
                 )
             ) from None
         except NoMatch as e:
+            # Try merge_slashes normalization as a fallback.
+            if self.map.merge_slashes and path_part:
+                normalized_path = re.sub("/{2,}", "/", path_part)
+                if normalized_path != path_part:
+                    try:
+                        rule, rv = self.map._matcher.match(
+                            domain_part, normalized_path, method, websocket
+                        )
+                    except RequestPath as e:
+                        new_path = quote(e.path_info, safe="!$&'()*+,/:;=@")
+                        raise RequestRedirect(
+                            self.make_redirect_url(new_path, query_args)
+                        ) from None
+                    except RequestAliasRedirect as e:
+                        raise RequestRedirect(
+                            self.make_alias_redirect_url(
+                                f"{domain_part}|{normalized_path}",
+                                e.endpoint,
+                                e.matched_values,
+                                method,
+                                query_args,
+                            )
+                        ) from None
+                    except NoMatch as retry_e:
+                        # Merge results from both attempts.
+                        e = NoMatch(
+                            e.have_match_for | retry_e.have_match_for,
+                            e.websocket_mismatch or retry_e.websocket_mismatch,
+                        )
+                    else:
+                        # Merge retry matched, but check if the rule opts out.
+                        if rule.merge_slashes is not False:
+                            # Alias takes priority: single redirect to
+                            # canonical URL instead of two redirects.
+                            if rule.alias and self.map.redirect_defaults:
+                                raise RequestRedirect(
+                                    self.make_alias_redirect_url(
+                                        f"{domain_part}|{normalized_path}",
+                                        rule.endpoint,
+                                        rv,
+                                        method,
+                                        query_args,
+                                    )
+                                ) from None
+                            new_path = quote(
+                                normalized_path, safe="!$&'()*+,/:;=@"
+                            )
+                            raise RequestRedirect(
+                                self.make_redirect_url(new_path, query_args)
+                            ) from None
+
             if e.have_match_for:
-                raise MethodNotAllowed(valid_methods=list(e.have_match_for)) from None
+                raise MethodNotAllowed(
+                    valid_methods=list(e.have_match_for)
+                ) from None
 
             if e.websocket_mismatch:
                 raise WebsocketMismatch() from None
 
             raise NotFound() from None
         else:
-            rule, rv = result
+            # Direct match succeeded — check alias redirect.
+            if rule.alias and self.map.redirect_defaults:
+                raise RequestRedirect(
+                    self.make_alias_redirect_url(
+                        f"{domain_part}|{path_part}",
+                        rule.endpoint,
+                        rv,
+                        method,
+                        query_args,
+                    )
+                ) from None
 
             if self.map.redirect_defaults:
                 redirect_url = self.get_default_redirect(rule, method, rv, query_args)
@@ -683,18 +749,16 @@ class MapAdapter:
                         value = rv[match.group(1)]
                         return rule._converters[match.group(1)].to_url(value)
 
-                    redirect_url = _simple_rule_re.sub(_handle_match, rule.redirect_to)
+                    redirect_url = _simple_rule_re.sub(
+                        _handle_match, rule.redirect_to
+                    )
                 else:
                     redirect_url = rule.redirect_to(self, **rv)
 
-                if self.subdomain:
-                    netloc = f"{self.subdomain}.{self.server_name}"
-                else:
-                    netloc = self.server_name
-
                 raise RequestRedirect(
                     urljoin(
-                        f"{self.url_scheme or 'http'}://{netloc}{self.script_name}",
+                        f"{self.url_scheme or 'http'}://"
+                        f"{self.get_host(domain_part)}{self.script_name}",
                         redirect_url,
                     )
                 )
@@ -805,7 +869,7 @@ class MapAdapter:
 
         scheme = self.url_scheme or "http"
         host = self.get_host(domain_part)
-        path = "/".join((self.script_name.strip("/"), path_info.lstrip("/")))
+        path = f"{self.script_name.rstrip('/')}/{path_info.lstrip('/')}"
         return urlunsplit((scheme, host, path, query_str, None))
 
     def make_alias_redirect_url(

@@ -1820,3 +1820,226 @@ def test_bind_untrusted_host() -> None:
 
     with pytest.raises(SecurityError):
         r.Map().bind_to_environ(req)
+
+
+# --- redirect_to tests ---
+
+
+def test_redirect_to_string():
+    m = r.Map(
+        [
+            r.Rule("/old", redirect_to="/new"),
+            r.Rule("/new", endpoint="new_page"),
+            r.Rule("/old/<int:id>", redirect_to="/new/<id>"),
+            r.Rule("/new/<int:id>", endpoint="new_detail"),
+        ]
+    )
+    a = m.bind("example.com", "/")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/old")
+    assert excinfo.value.new_url == "http://example.com/new"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/old/42")
+    assert excinfo.value.new_url == "http://example.com/new/42"
+
+
+def test_redirect_to_callable():
+    def redirect_func(adapter, id):
+        return f"new/{id}"
+
+    m = r.Map(
+        [
+            r.Rule("/old/<int:id>", redirect_to=redirect_func),
+            r.Rule("/new/<int:id>", endpoint="new_detail"),
+        ]
+    )
+    a = m.bind("example.com", "/")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/old/42")
+    assert excinfo.value.new_url == "http://example.com/new/42"
+
+
+def test_redirect_to_with_script_name():
+    m = r.Map(
+        [
+            r.Rule("/old", redirect_to="new"),
+            r.Rule("/new", endpoint="new_page"),
+        ]
+    )
+    a = m.bind("example.com", "/app/")
+
+    # redirect_to without leading slash is relative to script_name
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/old")
+    assert excinfo.value.new_url == "http://example.com/app/new"
+
+
+def test_redirect_to_with_subdomain():
+    m = r.Map(
+        [
+            r.Rule("/old", redirect_to="/new", subdomain="sub"),
+            r.Rule("/new", endpoint="new_page"),
+        ]
+    )
+    a = m.bind("example.com", "/", subdomain="sub")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/old")
+    assert excinfo.value.new_url == "http://sub.example.com/new"
+
+
+def test_redirect_to_with_host_matching():
+    m = r.Map(
+        [
+            r.Rule("/old", redirect_to="/new", host="myhost.com"),
+            r.Rule("/new", endpoint="new_page"),
+        ],
+        host_matching=True,
+    )
+    a = m.bind("myhost.com", "/")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/old")
+    assert excinfo.value.new_url == "http://myhost.com/new"
+
+
+# --- Cross-feature interaction tests ---
+
+
+def test_merge_slashes_and_alias_single_redirect():
+    """merge_slashes + alias should produce a single redirect to canonical URL,
+    not two redirects (merge first, then alias)."""
+    m = r.Map(
+        [
+            r.Rule("/foo/", endpoint="foo"),
+            r.Rule("/foo/index.html", endpoint="foo", alias=True),
+        ]
+    )
+    a = m.bind("example.com", "/")
+
+    # /foo//index.html should redirect DIRECTLY to /foo/ (canonical URL)
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/foo//index.html")
+    assert excinfo.value.new_url == "http://example.com/foo/"
+
+
+def test_merge_slashes_and_host_matching():
+    """merge_slashes redirect preserves correct host with host_matching."""
+    m = r.Map(
+        [
+            r.Rule("/x/foo/", host="myhost.com", endpoint="foo"),
+        ],
+        host_matching=True,
+    )
+    a = m.bind("myhost.com", "/")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/x//foo")
+    assert excinfo.value.new_url == "http://myhost.com/x/foo/"
+
+
+def test_merge_slashes_and_websocket():
+    """merge_slashes redirect uses correct scheme for websocket."""
+    m = r.Map(
+        [
+            r.Rule("/x/ws/", endpoint="ws", websocket=True),
+        ]
+    )
+    a = m.bind("example.com", "/", url_scheme="ws")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/x//ws")
+    assert excinfo.value.new_url == "ws://example.com/x/ws/"
+
+
+def test_alias_and_host_matching():
+    """Alias redirect uses correct host with host_matching."""
+    m = r.Map(
+        [
+            r.Rule("/", host="myhost.com", endpoint="index"),
+            r.Rule("/index.html", host="myhost.com", endpoint="index", alias=True),
+        ],
+        host_matching=True,
+    )
+    a = m.bind("myhost.com", "/")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/index.html")
+    assert excinfo.value.new_url == "http://myhost.com/"
+
+
+def test_merge_slashes_strict_slashes_combinations():
+    """Test combinations of merge_slashes and strict_slashes."""
+    m = r.Map(
+        [
+            r.Rule("/x/foo/", endpoint="branch"),
+            r.Rule("/x/bar", endpoint="leaf"),
+            r.Rule("/x/baz/", endpoint="baz_branch", strict_slashes=False),
+        ]
+    )
+    a = m.bind("example.com", "/")
+
+    # merge_slashes + trailing slash needed: /x//foo -> /x/foo/
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/x//foo")
+    assert excinfo.value.new_url == "http://example.com/x/foo/"
+
+    # merge_slashes on leaf: /x//bar -> /x/bar
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/x//bar")
+    assert excinfo.value.new_url == "http://example.com/x/bar"
+
+    # merge_slashes + strict_slashes=False: /x//baz -> /x/baz (no slash needed)
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/x//baz")
+    assert excinfo.value.new_url == "http://example.com/x/baz"
+
+
+def test_redirect_url_path_matches_build():
+    """The path portion of redirect URLs from match() should match build() output."""
+    m = r.Map(
+        [
+            r.Rule("/bar/", endpoint="bar"),
+        ]
+    )
+    a = m.bind("example.com", "/")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/bar")
+    # For subdomain_matching with same subdomain, build returns relative URL
+    built = a.build("bar")
+    # Extract path from redirect URL
+    from urllib.parse import urlparse
+
+    redirect_path = urlparse(excinfo.value.new_url).path
+    assert redirect_path == built
+
+
+def test_make_redirect_url_script_name_leading_slash():
+    """make_redirect_url produces proper absolute path for non-root script_name."""
+    m = r.Map([r.Rule("/bar/", endpoint="bar")])
+    a = m.bind("example.com", "/app/")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/bar")
+    assert excinfo.value.new_url == "http://example.com/app/bar/"
+
+
+def test_merge_slashes_per_rule_opt_out_no_redirect():
+    """Rule with merge_slashes=False rejects the normalized path during retry."""
+    m = r.Map(
+        [
+            r.Rule("/no//merge", endpoint="no_merge", merge_slashes=False),
+        ]
+    )
+    a = m.bind("localhost", "/")
+
+    # Direct match works
+    assert a.match("/no//merge") == ("no_merge", {})
+
+    # Normalized path should NOT match (rule opted out of merge_slashes)
+    pytest.raises(NotFound, lambda: a.match("/no/merge"))
+
