@@ -464,3 +464,174 @@ def test_multipart_max_form_memory_size() -> None:
 
     with pytest.raises(RequestEntityTooLarge):
         parser.parse(io.BytesIO(data), b"bound", None)
+
+
+@pytest.mark.parametrize("buffer_size", [5, 7, 13, 64, 256, 64 * 1024])
+def test_max_form_memory_size_consistent_across_chunk_sizes(buffer_size: int) -> None:
+    """max_form_memory_size raises regardless of how data is chunked."""
+    data = b"--bound\r\nContent-Disposition: form-field; name=a\r\n\r\n"
+    data += b"x" * 30 + b"\r\n--bound--"
+    parser = formparser.MultiPartParser(
+        max_form_memory_size=20, buffer_size=buffer_size
+    )
+    with pytest.raises(RequestEntityTooLarge):
+        parser.parse(io.BytesIO(data), b"bound", None)
+
+
+@pytest.mark.parametrize("buffer_size", [5, 7, 13, 64, 256, 64 * 1024])
+def test_max_form_parts_consistent_across_chunk_sizes(buffer_size: int) -> None:
+    """max_form_parts raises regardless of how part boundaries are chunked."""
+    data = (
+        b"--bound\r\nContent-Disposition: form-field; name=a\r\n\r\nval_a\r\n"
+        b"--bound\r\nContent-Disposition: form-field; name=b\r\n\r\nval_b\r\n"
+        b"--bound\r\nContent-Disposition: form-field; name=c\r\n\r\nval_c\r\n"
+        b"--bound--"
+    )
+    parser = formparser.MultiPartParser(
+        max_form_parts=2, buffer_size=buffer_size
+    )
+    with pytest.raises(RequestEntityTooLarge):
+        parser.parse(io.BytesIO(data), b"bound", None)
+
+
+def test_file_upload_exempt_from_max_form_memory_size() -> None:
+    """File parts stream to disk and must not be limited by max_form_memory_size."""
+    file_content = b"F" * 500
+    data = (
+        b"--bound\r\n"
+        b'Content-Disposition: form-data; name="myfile"; filename="big.bin"\r\n'
+        b"Content-Type: application/octet-stream\r\n\r\n"
+        + file_content
+        + b"\r\n--bound--"
+    )
+    for buffer_size in (5, 64, 64 * 1024):
+        parser = formparser.MultiPartParser(
+            max_form_memory_size=50, buffer_size=buffer_size
+        )
+        with parser:
+            fields, files = parser.parse(io.BytesIO(data), b"bound", None)
+        assert files["myfile"].read() == file_content
+        files["myfile"].close()
+
+
+def test_file_upload_with_small_field_under_limit() -> None:
+    """A small field + large file must succeed when field is under the limit."""
+    file_content = b"F" * 200
+    data = (
+        b"--bound\r\n"
+        b"Content-Disposition: form-data; name=txt\r\n\r\n"
+        b"hello\r\n"
+        b"--bound\r\n"
+        b'Content-Disposition: form-data; name="doc"; filename="doc.bin"\r\n'
+        b"Content-Type: application/octet-stream\r\n\r\n"
+        + file_content
+        + b"\r\n--bound--"
+    )
+    for buffer_size in (5, 64, 64 * 1024):
+        parser = formparser.MultiPartParser(
+            max_form_memory_size=50, buffer_size=buffer_size
+        )
+        with parser:
+            fields, files = parser.parse(io.BytesIO(data), b"bound", None)
+        assert fields["txt"] == "hello"
+        assert files["doc"].read() == file_content
+        files["doc"].close()
+
+
+@pytest.mark.parametrize("buffer_size", [5, 17, 64, 64 * 1024])
+def test_different_buffer_sizes_produce_same_result(buffer_size: int) -> None:
+    """Identical requests parsed with different buffer sizes yield identical output."""
+    data = (
+        b"--bound\r\n"
+        b"Content-Disposition: form-data; name=field1\r\n\r\n"
+        b"value_one\r\n"
+        b"--bound\r\n"
+        b'Content-Disposition: form-data; name="up"; filename="f.txt"\r\n'
+        b"Content-Type: text/plain\r\n\r\n"
+        b"file content here\r\n"
+        b"--bound\r\n"
+        b"Content-Disposition: form-data; name=field2\r\n\r\n"
+        b"value_two\r\n"
+        b"--bound--"
+    )
+    parser = formparser.MultiPartParser(buffer_size=buffer_size)
+    with parser:
+        fields, files = parser.parse(io.BytesIO(data), b"bound", None)
+    assert fields["field1"] == "value_one"
+    assert fields["field2"] == "value_two"
+    assert files["up"].read() == b"file content here"
+    files["up"].close()
+
+
+def test_silent_does_not_swallow_request_entity_too_large() -> None:
+    """silent=True suppresses ValueError but must not suppress RequestEntityTooLarge."""
+    data = b"--bound\r\nContent-Disposition: form-field; name=a\r\n\r\n"
+    data += b"a" * 30 + b"\r\n--bound--"
+
+    with pytest.raises(RequestEntityTooLarge):
+        formparser.parse_form_data(
+            {
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": "multipart/form-data; boundary=bound",
+                "CONTENT_LENGTH": str(len(data)),
+                "wsgi.input": io.BytesIO(data),
+            },
+            silent=True,
+            max_form_memory_size=10,
+        )
+
+
+def test_silent_does_not_swallow_max_form_parts() -> None:
+    """silent=True must not suppress RequestEntityTooLarge from max_form_parts."""
+    data = (
+        b"--bound\r\nContent-Disposition: form-field; name=a\r\n\r\nv\r\n"
+        b"--bound\r\nContent-Disposition: form-field; name=b\r\n\r\nv\r\n"
+        b"--bound--"
+    )
+    with pytest.raises(RequestEntityTooLarge):
+        formparser.parse_form_data(
+            {
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": "multipart/form-data; boundary=bound",
+                "CONTENT_LENGTH": str(len(data)),
+                "wsgi.input": io.BytesIO(data),
+            },
+            silent=True,
+            max_form_parts=1,
+        )
+
+
+def test_request_state_after_size_exception() -> None:
+    """After RequestEntityTooLarge, request.form and request.files return empty dicts."""
+    data = b"--bound\r\nContent-Disposition: form-field; name=a\r\n\r\n"
+    data += b"a" * 30 + b"\r\n--bound--"
+
+    with Request.from_values(
+        data=data,
+        content_type="multipart/form-data; boundary=bound",
+        method="POST",
+    ) as req:
+        req.max_form_memory_size = 10
+        with pytest.raises(RequestEntityTooLarge):
+            req.form
+        assert req.form == ImmutableMultiDict()
+        assert req.files == ImmutableMultiDict()
+
+
+def test_request_state_after_parts_exception() -> None:
+    """After max_form_parts exceeded, request.form and request.files return empty dicts."""
+    data = (
+        b"--bound\r\nContent-Disposition: form-field; name=a\r\n\r\nv\r\n"
+        b"--bound\r\nContent-Disposition: form-field; name=b\r\n\r\nv\r\n"
+        b"--bound--"
+    )
+    with Request.from_values(
+        data=data,
+        content_type="multipart/form-data; boundary=bound",
+        method="POST",
+    ) as req:
+        req.max_form_parts = 1
+        with pytest.raises(RequestEntityTooLarge):
+            req.form
+        assert req.form == ImmutableMultiDict()
+        assert req.files == ImmutableMultiDict()

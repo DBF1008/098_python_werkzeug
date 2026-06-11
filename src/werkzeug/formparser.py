@@ -400,7 +400,6 @@ class MultiPartParser:
 
         parser = MultipartDecoder(
             boundary,
-            max_form_memory_size=self.max_form_memory_size,
             max_parts=self.max_form_parts,
         )
 

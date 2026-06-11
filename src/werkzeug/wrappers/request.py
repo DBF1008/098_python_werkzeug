@@ -278,12 +278,17 @@ class Request(_SansIORequest):
 
         if self.want_form_data_parsed:
             parser = self.make_form_data_parser()
-            data = parser.parse(
-                self._get_stream_for_parsing(),
-                self.mimetype,
-                self.content_length,
-                self.mimetype_params,
-            )
+            try:
+                data = parser.parse(
+                    self._get_stream_for_parsing(),
+                    self.mimetype,
+                    self.content_length,
+                    self.mimetype_params,
+                )
+            except Exception:
+                self.__dict__["form"] = ImmutableMultiDict()
+                self.__dict__["files"] = ImmutableMultiDict()
+                raise
         else:
             if self.parameter_storage_class is not None:
                 import warnings

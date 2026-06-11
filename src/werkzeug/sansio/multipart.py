@@ -93,7 +93,6 @@ class MultipartDecoder:
     ) -> None:
         self.buffer = bytearray()
         self.complete = False
-        self.max_form_memory_size = max_form_memory_size
         self.max_parts = max_parts
         self.state = State.PREAMBLE
         self.boundary = boundary
@@ -127,100 +126,91 @@ class MultipartDecoder:
     def receive_data(self, data: bytes | None) -> None:
         if data is None:
             self.complete = True
-        elif (
-            self.max_form_memory_size is not None
-            and len(self.buffer) + len(data) > self.max_form_memory_size
-        ):
-            # Ensure that data within single event does not exceed limit.
-            # Also checked across accumulated events in MultiPartParser.
-            raise RequestEntityTooLarge()
         else:
             self.buffer.extend(data)
 
     def next_event(self) -> Event:
-        event: Event = NEED_DATA
-        if self.state == State.PREAMBLE:
-            match = self.preamble_re.search(self.buffer, self._search_position)
-            if match is not None:
-                if match.group(1).startswith(b"--"):
-                    self.state = State.EPILOGUE
-                else:
-                    self.state = State.PART
-                data = bytes(self.buffer[: match.start()])
-                del self.buffer[: match.end()]
-                event = Preamble(data=data)
-                self._search_position = 0
-            else:
-                # Update the search start position to be equal to the
-                # current buffer length (already searched) minus a
-                # safe buffer for part of the search target.
-                self._search_position = max(
-                    0, len(self.buffer) - len(self.boundary) - SEARCH_EXTRA_LENGTH
-                )
+        handler = {
+            State.PREAMBLE: self._handle_preamble,
+            State.PART: self._handle_part,
+            State.DATA_START: self._handle_data_start,
+            State.DATA: self._handle_data,
+            State.EPILOGUE: self._handle_epilogue,
+        }.get(self.state)
 
-        elif self.state == State.PART:
-            match = BLANK_LINE_RE.search(self.buffer, self._search_position)
-            if match is not None:
-                headers = self._parse_headers(self.buffer[: match.start()])
-                # The final header ends with a single CRLF, however a
-                # blank line indicates the start of the
-                # body. Therefore the end is after the first CRLF.
-                headers_end = (match.start() + match.end()) // 2
-                del self.buffer[:headers_end]
-
-                if "Content-Disposition" not in headers:
-                    raise ValueError("Missing Content-Disposition header")
-
-                disposition, extra = parse_options_header(
-                    headers["Content-Disposition"]
-                )
-                name = t.cast(str, extra.get("name"))
-                filename = extra.get("filename")
-                if filename is not None:
-                    event = File(
-                        filename=filename,
-                        headers=headers,
-                        name=name,
-                    )
-                else:
-                    event = Field(
-                        headers=headers,
-                        name=name,
-                    )
-                self.state = State.DATA_START
-                self._search_position = 0
-                self._parts_decoded += 1
-
-                if self.max_parts is not None and self._parts_decoded > self.max_parts:
-                    raise RequestEntityTooLarge()
-            else:
-                # Update the search start position to be equal to the
-                # current buffer length (already searched) minus a
-                # safe buffer for part of the search target.
-                self._search_position = max(0, len(self.buffer) - SEARCH_EXTRA_LENGTH)
-
-        elif self.state == State.DATA_START:
-            data, del_index, more_data = self._parse_data(self.buffer, start=True)
-            del self.buffer[:del_index]
-            event = Data(data=data, more_data=more_data)
-            if more_data:
-                self.state = State.DATA
-
-        elif self.state == State.DATA:
-            data, del_index, more_data = self._parse_data(self.buffer, start=False)
-            del self.buffer[:del_index]
-            if data or not more_data:
-                event = Data(data=data, more_data=more_data)
-
-        elif self.state == State.EPILOGUE and self.complete:
-            event = Epilogue(data=bytes(self.buffer))
-            del self.buffer[:]
-            self.state = State.COMPLETE
+        event: Event = handler() if handler is not None else NEED_DATA
 
         if self.complete and isinstance(event, NeedData):
             raise ValueError(f"Invalid form-data cannot parse beyond {self.state}")
 
         return event
+
+    def _handle_preamble(self) -> Event:
+        match = self.preamble_re.search(self.buffer, self._search_position)
+        if match is not None:
+            if match.group(1).startswith(b"--"):
+                self.state = State.EPILOGUE
+            else:
+                self.state = State.PART
+            data = bytes(self.buffer[: match.start()])
+            del self.buffer[: match.end()]
+            self._search_position = 0
+            return Preamble(data=data)
+
+        self._search_position = max(
+            0, len(self.buffer) - len(self.boundary) - SEARCH_EXTRA_LENGTH
+        )
+        return NEED_DATA
+
+    def _handle_part(self) -> Event:
+        match = BLANK_LINE_RE.search(self.buffer, self._search_position)
+        if match is None:
+            self._search_position = max(0, len(self.buffer) - SEARCH_EXTRA_LENGTH)
+            return NEED_DATA
+
+        headers = self._parse_headers(self.buffer[: match.start()])
+        headers_end = (match.start() + match.end()) // 2
+        del self.buffer[:headers_end]
+
+        if "Content-Disposition" not in headers:
+            raise ValueError("Missing Content-Disposition header")
+
+        disposition, extra = parse_options_header(headers["Content-Disposition"])
+        name = t.cast(str, extra.get("name"))
+        filename = extra.get("filename")
+
+        self.state = State.DATA_START
+        self._search_position = 0
+        self._parts_decoded += 1
+
+        if self.max_parts is not None and self._parts_decoded > self.max_parts:
+            raise RequestEntityTooLarge()
+
+        if filename is not None:
+            return File(filename=filename, headers=headers, name=name)
+        return Field(headers=headers, name=name)
+
+    def _handle_data_start(self) -> Event:
+        data, del_index, more_data = self._parse_data(self.buffer, start=True)
+        del self.buffer[:del_index]
+        if more_data:
+            self.state = State.DATA
+        return Data(data=data, more_data=more_data)
+
+    def _handle_data(self) -> Event:
+        data, del_index, more_data = self._parse_data(self.buffer, start=False)
+        del self.buffer[:del_index]
+        if data or not more_data:
+            return Data(data=data, more_data=more_data)
+        return NEED_DATA
+
+    def _handle_epilogue(self) -> Event:
+        if self.complete:
+            event = Epilogue(data=bytes(self.buffer))
+            del self.buffer[:]
+            self.state = State.COMPLETE
+            return event
+        return NEED_DATA
 
     def _parse_headers(self, data: bytes | bytearray) -> Headers:
         headers: list[tuple[str, str]] = []
@@ -274,7 +264,9 @@ class MultipartDecoder:
         # position of a LF or a CR, unless that position is more
         # than a complete boundary from the end in which case there
         # is no partial boundary.
-        complete_boundary_index = len(data) - len(b"\r\n--" + self.boundary)
+        complete_boundary_index = (
+            len(data) - len(b"\r\n--" + self.boundary) - SEARCH_EXTRA_LENGTH
+        )
         try:
             last_nl = data.rindex(b"\n")
         except ValueError:
