@@ -171,6 +171,20 @@ class StateMachineMatcher:
 
             return None
 
+        def _process_values(
+            rule: Rule, values: list[str]
+        ) -> dict[str, t.Any]:
+            result: dict[str, t.Any] = {}
+            for name, value in zip(rule._converters.keys(), values, strict=True):
+                try:
+                    value = rule._converters[name].to_python(value)
+                except ValidationError:
+                    raise NoMatch(have_match_for, websocket_mismatch) from None
+                result[str(name)] = value
+            if rule.defaults:
+                result.update(rule.defaults)
+            return result
+
         try:
             rv = _match(self._root, [domain, *path.split("/")], [])
         except SlashRequired:
@@ -185,24 +199,16 @@ class StateMachineMatcher:
                 raise RequestPath(f"{path}/") from None
             if rv is None or rv[0].merge_slashes is False:
                 raise NoMatch(have_match_for, websocket_mismatch)
-            else:
-                raise RequestPath(f"{path}")
-        elif rv is not None:
             rule, values = rv
-
-            result = {}
-            for name, value in zip(rule._converters.keys(), values, strict=True):
-                try:
-                    value = rule._converters[name].to_python(value)
-                except ValidationError:
-                    raise NoMatch(have_match_for, websocket_mismatch) from None
-                result[str(name)] = value
-            if rule.defaults:
-                result.update(rule.defaults)
-
+            result = _process_values(rule, values)
             if rule.alias and rule.map.redirect_defaults:
                 raise RequestAliasRedirect(result, rule.endpoint)
-
+            raise RequestPath(f"{path}")
+        elif rv is not None:
+            rule, values = rv
+            result = _process_values(rule, values)
+            if rule.alias and rule.map.redirect_defaults:
+                raise RequestAliasRedirect(result, rule.endpoint)
             return rule, result
 
         raise NoMatch(have_match_for, websocket_mismatch)

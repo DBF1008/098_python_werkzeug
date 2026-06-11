@@ -170,6 +170,139 @@ def test_merge_slashes_build():
     assert adapter.build("no_merge") == "/no//merge"
 
 
+def test_merge_slashes_with_alias():
+    m = r.Map(
+        [
+            r.Rule("/", endpoint="index"),
+            r.Rule("/index.html", endpoint="index", alias=True),
+            r.Rule("/users/", defaults={"page": 1}, endpoint="users"),
+            r.Rule(
+                "/users/index.html", defaults={"page": 1}, alias=True, endpoint="users"
+            ),
+            r.Rule("/users/page/<int:page>", endpoint="users"),
+            r.Rule("/users/page-<int:page>.html", alias=True, endpoint="users"),
+        ]
+    )
+    a = m.bind("example.com")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("//index.html")
+    assert excinfo.value.new_url == "http://example.com/"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/users//index.html")
+    assert excinfo.value.new_url == "http://example.com/users/"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/users//page-2.html")
+    assert excinfo.value.new_url == "http://example.com/users/page/2"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/users//page-1.html")
+    assert excinfo.value.new_url == "http://example.com/users/"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/users//page-1.html", query_args={"foo": "bar"})
+    assert excinfo.value.new_url == "http://example.com/users/?foo=bar"
+
+
+def test_merge_slashes_without_alias_unchanged():
+    m = r.Map(
+        [
+            r.Rule("/no/tail", endpoint="no_tail"),
+            r.Rule("/yes/tail/", endpoint="yes_tail"),
+        ]
+    )
+    a = m.bind("example.com")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/no//tail")
+    assert excinfo.value.new_url == "http://example.com/no/tail"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/yes//tail/")
+    assert excinfo.value.new_url == "http://example.com/yes/tail/"
+
+
+def test_merge_slashes_alias_with_converter_validation_failure():
+    m = r.Map(
+        [
+            r.Rule("/items/<int(min=1, max=100):id>", endpoint="items"),
+        ]
+    )
+    a = m.bind("example.com")
+
+    with pytest.raises(NotFound):
+        a.match("/items//999")
+
+
+def test_merge_slashes_alias_host_matching():
+    m = r.Map(
+        [
+            r.Rule("/", host="app.example.com", endpoint="index"),
+            r.Rule(
+                "/index.html", host="app.example.com", endpoint="index", alias=True
+            ),
+            r.Rule(
+                "/page/",
+                host="app.example.com",
+                defaults={"page": 1},
+                endpoint="page",
+            ),
+            r.Rule("/page/<int:page>", host="app.example.com", endpoint="page"),
+            r.Rule(
+                "/page-<int:page>.html",
+                host="app.example.com",
+                endpoint="page",
+                alias=True,
+            ),
+        ],
+        host_matching=True,
+    )
+    a = m.bind("app.example.com")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("//index.html")
+    assert excinfo.value.new_url == "http://app.example.com/"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("//page-2.html")
+    assert excinfo.value.new_url == "http://app.example.com/page/2"
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("//page-1.html")
+    assert excinfo.value.new_url == "http://app.example.com/page/"
+
+
+def test_merge_slashes_alias_websocket():
+    m = r.Map(
+        [
+            r.Rule("/ws", endpoint="ws", websocket=True),
+            r.Rule("/ws-old", endpoint="ws", websocket=True, alias=True),
+        ]
+    )
+    a = m.bind("example.com", url_scheme="ws")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("//ws-old")
+    assert excinfo.value.new_url == "ws://example.com/ws"
+
+
+def test_merge_slashes_alias_redirect_defaults_disabled():
+    m = r.Map(
+        [
+            r.Rule("/pages/", endpoint="pages"),
+            r.Rule("/pages/index.html", endpoint="pages", alias=True),
+        ],
+        redirect_defaults=False,
+    )
+    a = m.bind("example.com")
+
+    with pytest.raises(r.RequestRedirect) as excinfo:
+        a.match("/pages//index.html")
+    assert excinfo.value.new_url == "http://example.com/pages/index.html"
+
+
 def test_strict_slashes_redirect():
     map = r.Map(
         [
