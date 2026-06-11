@@ -515,8 +515,12 @@ class Headers:
         """
         if arg is not None:
             if isinstance(arg, (Headers, MultiDict)):
+                seen: set[str] = set()
                 for key in arg.keys():
-                    self.setlist(key, arg.getlist(key))
+                    lkey = key.lower()
+                    if lkey not in seen:
+                        seen.add(lkey)
+                        self.setlist(key, arg.getlist(key))
             elif isinstance(arg, cabc.Mapping):
                 for key, value in arg.items():
                     if isinstance(value, (list, tuple, set)):
@@ -524,8 +528,17 @@ class Headers:
                     else:
                         self.set(key, value)
             else:
+                seen_iter: dict[str, tuple[str, list[t.Any]]] = {}
+                order: list[str] = []
                 for key, value in arg:
-                    self.set(key, value)
+                    lkey = key.lower()
+                    if lkey not in seen_iter:
+                        seen_iter[lkey] = (key, [])
+                        order.append(lkey)
+                    seen_iter[lkey][1].append(value)
+                for lkey in order:
+                    key, values = seen_iter[lkey]
+                    self.setlist(key, values)
 
         for key, value in kwargs.items():
             if isinstance(value, (list, tuple, set)):

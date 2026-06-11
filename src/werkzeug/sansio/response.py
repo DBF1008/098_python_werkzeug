@@ -31,7 +31,7 @@ from ..utils import get_content_type
 from ..utils import header_property
 
 
-def _set_property(name: str, doc: str | None = None) -> property:
+def _header_set_property(name: str, doc: str | None = None) -> property:
     def fget(self: Response) -> HeaderSet:
         def on_update(header_set: HeaderSet) -> None:
             if not header_set and name in self.headers:
@@ -493,21 +493,21 @@ class Response:
             value = str(value)
         self.headers["Retry-After"] = value
 
-    vary = _set_property(
+    vary = _header_set_property(
         "Vary",
         doc="""The Vary field value indicates the set of request-header
         fields that fully determines, while the response is fresh,
         whether a cache is permitted to use the response to reply to a
         subsequent request without revalidation.""",
     )
-    content_language = _set_property(
+    content_language = _header_set_property(
         "Content-Language",
         doc="""The Content-Language entity-header field describes the
         natural language(s) of the intended audience for the enclosed
         entity. Note that this might not be equivalent to all the
         languages used within the entity-body.""",
     )
-    allow = _set_property(
+    allow = _header_set_property(
         "Allow",
         doc="""The Allow entity-header field lists the set of methods
         supported by the resource identified by the Request-URI. The

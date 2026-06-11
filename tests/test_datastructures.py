@@ -662,6 +662,43 @@ class TestHeaders:
         a |= {"y": 2}
         assert "x" in a and "y" in a
 
+    def test_update_iterable_of_pairs_multi_values(self) -> None:
+        h = ds.Headers([("X-Before", "keep")])
+        h.update([("X-Custom", "a"), ("X-Custom", "b"), ("X-Other", "c")])
+        assert h.getlist("X-Custom") == ["a", "b"]
+        assert h.getlist("X-Other") == ["c"]
+        assert h.getlist("X-Before") == ["keep"]
+
+    def test_update_iterable_replaces_existing(self) -> None:
+        h = ds.Headers([("Vary", "old1"), ("Vary", "old2")])
+        h.update([("Vary", "Accept"), ("Vary", "Cookie")])
+        assert h.getlist("Vary") == ["Accept", "Cookie"]
+
+    def test_update_headers_object_dedup(self) -> None:
+        src = ds.Headers([("X-A", "1"), ("X-A", "2"), ("X-B", "3")])
+        dest = ds.Headers([("X-A", "old")])
+        dest.update(src)
+        assert dest.getlist("X-A") == ["1", "2"]
+        assert dest.getlist("X-B") == ["3"]
+
+    def test_copy_multi_values(self) -> None:
+        h = ds.Headers([("X-Multi", "a"), ("X-Multi", "b"), ("X-Single", "c")])
+        h2 = h.copy()
+        assert h2.getlist("X-Multi") == ["a", "b"]
+        assert h2.getlist("X-Single") == ["c"]
+        h.add("X-Multi", "d")
+        assert h2.getlist("X-Multi") == ["a", "b"]
+
+    def test_round_trip_multi_value_headers(self) -> None:
+        original = ds.Headers(
+            [("Vary", "Accept"), ("Vary", "Cookie"), ("X-Foo", "bar")]
+        )
+        pairs = list(original)
+        restored = ds.Headers()
+        restored.update(pairs)
+        assert restored.getlist("Vary") == ["Accept", "Cookie"]
+        assert restored.getlist("X-Foo") == ["bar"]
+
 
 class TestEnvironHeaders:
     storage_class = ds.EnvironHeaders

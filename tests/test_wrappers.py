@@ -1008,6 +1008,36 @@ def test_response_headers_passthrough():
     assert resp.headers is headers
 
 
+def test_request_to_response_header_round_trip():
+    env = create_environ(
+        headers=[
+            ("X-Multi", "val1"),
+            ("X-Multi", "val2"),
+            ("X-Single", "only"),
+            ("Vary", "Accept"),
+            ("Vary", "Cookie"),
+        ]
+    )
+    req = wrappers.Request(env)
+    resp = wrappers.Response()
+    resp.headers.update(list(req.headers))
+    # WSGI merges same-name headers into comma-separated values.
+    assert "val1" in resp.headers["X-Multi"]
+    assert "val2" in resp.headers["X-Multi"]
+    assert resp.headers["X-Single"] == "only"
+    assert "Accept" in resp.headers["Vary"]
+    assert "Cookie" in resp.headers["Vary"]
+
+    # Direct Headers-to-Headers round-trip preserves multi-value entries.
+    src = Headers(
+        [("X-Multi", "a"), ("X-Multi", "b"), ("Vary", "Accept"), ("Vary", "Cookie")]
+    )
+    dest = Headers()
+    dest.update(list(src))
+    assert dest.getlist("X-Multi") == ["a", "b"]
+    assert dest.getlist("Vary") == ["Accept", "Cookie"]
+
+
 def test_response_304_no_content_length():
     resp = wrappers.Response("Test", status=304)
     env = create_environ()
