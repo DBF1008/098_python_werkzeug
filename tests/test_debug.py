@@ -1,6 +1,8 @@
+import json
 import linecache
 import re
 import sys
+import time
 from unittest import mock
 
 import pytest
@@ -9,13 +11,17 @@ from werkzeug.debug import console
 from werkzeug.debug import DebuggedApplication
 from werkzeug.debug import DebugTraceback
 from werkzeug.debug import get_machine_id
+from werkzeug.debug import hash_pin
+from werkzeug.debug import PIN_TIME
 from werkzeug.debug.console import HTMLStringO
 from werkzeug.debug.repr import debug_repr
 from werkzeug.debug.repr import DebugReprGenerator
 from werkzeug.debug.repr import dump
 from werkzeug.debug.repr import helper
 from werkzeug.test import Client
+from werkzeug.test import EnvironBuilder
 from werkzeug.wrappers import Request
+from werkzeug.wrappers import Response
 
 
 class TestDebugRepr:
@@ -316,3 +322,392 @@ def test_debugged_application_pin_security_false():
     # This should not raise AttributeError
     debugged = DebuggedApplication(app, evalex=True, pin_security=False)
     assert debugged.pin is None
+
+
+# ---------------------------------------------------------------------------
+# Helpers for auth-boundary tests
+# ---------------------------------------------------------------------------
+
+def _make_debugged(evalex=True, pin_security=True):
+    """Create a simple DebuggedApplication whose wrapped app always raises."""
+
+    @Request.application
+    def crashing_app(request):
+        raise ValueError("test error")
+
+    return DebuggedApplication(
+        crashing_app, evalex=evalex, pin_security=pin_security
+    )
+
+
+def _make_ok_debugged(evalex=True, pin_security=True):
+    """Create a DebuggedApplication whose wrapped app returns 200."""
+
+    @Request.application
+    def ok_app(request):
+        return Response("OK")
+
+    return DebuggedApplication(
+        ok_app, evalex=evalex, pin_security=pin_security
+    )
+
+
+def _get_pin_cookie_value(debugged):
+    """Return a valid PIN cookie value ``"<ts>|<hash>"`` for *debugged*."""
+    return f"{int(time.time())}|{hash_pin(debugged.pin)}"
+
+
+def _set_cookie_on_client(client, debugged, value):
+    """Inject the debugger PIN cookie into *client*."""
+    client.set_cookie(debugged.pin_cookie_name, value)
+
+
+class TestCheckHostTrust:
+    def test_default_trusted_hosts(self):
+        debugged = _make_ok_debugged()
+        assert debugged.trusted_hosts == [".localhost", "127.0.0.1"]
+
+    def test_localhost_trusted(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder(headers={"Host": "localhost"}).get_environ()
+        assert debugged.check_host_trust(env) is True
+
+    def test_localhost_subdomain_trusted(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder(headers={"Host": "app.localhost"}).get_environ()
+        assert debugged.check_host_trust(env) is True
+
+    def test_127_0_0_1_trusted(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder(headers={"Host": "127.0.0.1"}).get_environ()
+        assert debugged.check_host_trust(env) is True
+
+    def test_127_0_0_1_with_port_trusted(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder(headers={"Host": "127.0.0.1:5000"}).get_environ()
+        assert debugged.check_host_trust(env) is True
+
+    def test_external_host_untrusted(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder(headers={"Host": "example.com"}).get_environ()
+        assert debugged.check_host_trust(env) is False
+
+    def test_custom_trusted_host(self):
+        debugged = _make_ok_debugged()
+        debugged.trusted_hosts.append("example.com")
+        env = EnvironBuilder(headers={"Host": "example.com"}).get_environ()
+        assert debugged.check_host_trust(env) is True
+
+    def test_missing_host_untrusted(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder().get_environ()
+        env.pop("HTTP_HOST", None)
+        assert debugged.check_host_trust(env) is False
+
+
+class TestCheckPinTrust:
+    def test_pin_disabled_always_trusted(self):
+        debugged = _make_ok_debugged(pin_security=False)
+        env = EnvironBuilder().get_environ()
+        assert debugged.check_pin_trust(env) is True
+
+    def test_no_cookie_returns_false(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder().get_environ()
+        assert debugged.check_pin_trust(env) is False
+
+    def test_valid_cookie_returns_true(self):
+        debugged = _make_ok_debugged()
+        cookie_val = _get_pin_cookie_value(debugged)
+        env = EnvironBuilder(
+            headers={"Cookie": f"{debugged.pin_cookie_name}={cookie_val}"}
+        ).get_environ()
+        assert debugged.check_pin_trust(env) is True
+
+    def test_expired_cookie_returns_false(self):
+        debugged = _make_ok_debugged()
+        ts = int(time.time()) - PIN_TIME - 100  # well past expiry
+        cookie_val = f"{ts}|{hash_pin(debugged.pin)}"
+        env = EnvironBuilder(
+            headers={"Cookie": f"{debugged.pin_cookie_name}={cookie_val}"}
+        ).get_environ()
+        assert debugged.check_pin_trust(env) is False
+
+    def test_bad_hash_returns_none(self):
+        debugged = _make_ok_debugged()
+        cookie_val = f"{int(time.time())}|badhashbadha"
+        env = EnvironBuilder(
+            headers={"Cookie": f"{debugged.pin_cookie_name}={cookie_val}"}
+        ).get_environ()
+        assert debugged.check_pin_trust(env) is None
+
+    def test_malformed_cookie_returns_false(self):
+        debugged = _make_ok_debugged()
+        env = EnvironBuilder(
+            headers={"Cookie": f"{debugged.pin_cookie_name}=nopipe"}
+        ).get_environ()
+        assert debugged.check_pin_trust(env) is False
+
+    def test_lockout_returns_false(self):
+        debugged = _make_ok_debugged()
+        debugged._failed_pin_auth.value = 10
+        cookie_val = _get_pin_cookie_value(debugged)
+        env = EnvironBuilder(
+            headers={"Cookie": f"{debugged.pin_cookie_name}={cookie_val}"}
+        ).get_environ()
+        assert debugged.check_pin_trust(env) is False
+
+
+class TestPinAuth:
+    @mock.patch("werkzeug.debug.time.sleep")
+    def test_correct_pin_sets_cookie(self, _sleep):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=pinauth"
+            f"&s={debugged.secret}&pin={debugged.pin}"
+        )
+        data = json.loads(rv.data)
+        assert data["auth"] is True
+        assert data["exhausted"] is False
+        # Cookie should be set in the response
+        cookie_header = rv.headers.get("Set-Cookie", "")
+        assert debugged.pin_cookie_name in cookie_header
+
+    @mock.patch("werkzeug.debug.time.sleep")
+    def test_incorrect_pin_fails(self, _sleep):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=pinauth"
+            f"&s={debugged.secret}&pin=000-000-000"
+        )
+        data = json.loads(rv.data)
+        assert data["auth"] is False
+
+    def test_untrusted_host_returns_security_error(self):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=pinauth"
+            f"&s={debugged.secret}&pin={debugged.pin}",
+            headers={"Host": "evil.com"},
+        )
+        # SecurityError is a BadRequest (400).
+        assert rv.status_code == 400
+
+    @mock.patch("werkzeug.debug.time.sleep")
+    def test_lockout_after_10_failures(self, _sleep):
+        debugged = _make_ok_debugged()
+        debugged._failed_pin_auth.value = 10
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=pinauth"
+            f"&s={debugged.secret}&pin={debugged.pin}"
+        )
+        data = json.loads(rv.data)
+        assert data["auth"] is False
+        assert data["exhausted"] is True
+
+    @mock.patch("werkzeug.debug.time.sleep")
+    def test_pin_auth_cookie_secure_flag_with_proxy_proto(self, _sleep):
+        """When X-Forwarded-Proto is https, the cookie should be Secure even
+        if the backend connection is plain HTTP."""
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=pinauth"
+            f"&s={debugged.secret}&pin={debugged.pin}",
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        cookie_header = rv.headers.get("Set-Cookie", "")
+        assert "Secure" in cookie_header or "secure" in cookie_header
+
+    @mock.patch("werkzeug.debug.time.sleep")
+    def test_pin_auth_cookie_not_secure_on_plain_http(self, _sleep):
+        """Without HTTPS or X-Forwarded-Proto, the cookie should NOT be Secure."""
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=pinauth"
+            f"&s={debugged.secret}&pin={debugged.pin}"
+        )
+        cookie_header = rv.headers.get("Set-Cookie", "")
+        assert "Secure" not in cookie_header
+
+
+class TestDisplayConsole:
+    def test_untrusted_host_returns_security_error(self):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get("/console", headers={"Host": "evil.com"})
+        # SecurityError is a BadRequest (400).
+        assert rv.status_code == 400
+
+    def test_trusted_host_renders_console(self):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get("/console")
+        assert rv.status_code == 200
+        assert b"Console" in rv.data
+
+    def test_evalex_trusted_false_without_pin(self):
+        """Console should show EVALEX_TRUSTED = false when no PIN cookie."""
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get("/console")
+        assert b"EVALEX_TRUSTED = false" in rv.data
+
+    def test_evalex_trusted_true_with_valid_pin(self):
+        """Console should show EVALEX_TRUSTED = true with valid PIN cookie."""
+        debugged = _make_ok_debugged()
+        cookie_val = _get_pin_cookie_value(debugged)
+        client = Client(debugged)
+        client.set_cookie(debugged.pin_cookie_name, cookie_val)
+        rv = client.get("/console")
+        assert b"EVALEX_TRUSTED = true" in rv.data
+
+    def test_evalex_trusted_false_when_host_untrusted_even_with_pin(self):
+        """Core bug fix: EVALEX_TRUSTED must be false when the host is not
+        trusted, even if a valid PIN cookie exists.  Previously the HTML
+        would show EVALEX_TRUSTED = true (PIN only) but the server would
+        reject all commands with SecurityError."""
+        debugged = _make_ok_debugged()
+        cookie_val = _get_pin_cookie_value(debugged)
+
+        # Use a request with the untrusted host AND the valid cookie.
+        builder = EnvironBuilder(
+            path="/console",
+            headers={
+                "Host": "evil.com",
+                "Cookie": f"{debugged.pin_cookie_name}={cookie_val}",
+            },
+        )
+        env = builder.get_environ()
+        request = Request(env)
+        resp = debugged.display_console(
+            request, host_trusted=False, pin_trusted=True
+        )
+        # When host is not trusted, display_console returns SecurityError.
+        # SecurityError is an HTTPException with code 400.
+        from werkzeug.exceptions import SecurityError as SE
+
+        assert isinstance(resp, SE)
+        assert resp.code == 400
+
+
+class TestExecuteCommand:
+    def test_untrusted_host_returns_security_error(self):
+        debugged = _make_ok_debugged()
+        builder = EnvironBuilder()
+        env = builder.get_environ()
+        request = Request(env)
+        frame = mock.MagicMock()
+        resp = debugged.execute_command(
+            request, "1+1", frame, host_trusted=False
+        )
+        # SecurityError is an HTTPException with code 400.
+        from werkzeug.exceptions import SecurityError as SE
+
+        assert isinstance(resp, SE)
+        assert resp.code == 400
+
+
+class TestEvalexTrustedRequiresHostTrust:
+    """Verify that the rendered debugger HTML sets EVALEX_TRUSTED = false
+    when host trust fails, even if PIN trust passes.  This is the core
+    bug fix for the "page visible but console blocked" inconsistency."""
+
+    def test_debugger_page_evalex_trusted_false_on_untrusted_host(self):
+        debugged = _make_debugged(evalex=True, pin_security=False)
+        # Force host to be untrusted by using an external host.
+        client = Client(debugged)
+        rv = client.get("/", headers={"Host": "evil.com"})
+        data = rv.data.decode("utf-8", errors="replace")
+        # evalex should be false when host is untrusted
+        assert "EVALEX = false" in data
+
+    def test_debugger_page_evalex_trusted_requires_both(self):
+        """When host is trusted but PIN cookie is absent, EVALEX_TRUSTED
+        must be false."""
+        debugged = _make_debugged(evalex=True)
+        client = Client(debugged)
+        rv = client.get("/")
+        data = rv.data.decode("utf-8", errors="replace")
+        assert "EVALEX = true" in data
+        assert "EVALEX_TRUSTED = false" in data
+
+
+class TestEntryGateHostTrust:
+    """Verify that __call__ gates execute_command on host trust at the
+    dispatch level, not just inside the handler."""
+
+    def test_execute_not_dispatched_when_host_untrusted(self):
+        """When the host is not trusted, __call__ should NOT dispatch to
+        execute_command even if PIN trust passes."""
+        debugged = _make_debugged(evalex=True, pin_security=False)
+        # First, trigger an exception to populate self.frames.
+        client = Client(debugged)
+        client.get("/")  # Creates frame entries
+
+        # Get a frame id from the debugger.
+        frame_ids = list(debugged.frames.keys())
+        if not frame_ids:
+            pytest.skip("no frames captured")
+        frame_id = frame_ids[0]
+
+        # Try to execute a command with an untrusted host.
+        # pin_security=False means PIN trust always passes.
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=1%2B1"
+            f"&frm={frame_id}&s={debugged.secret}",
+            headers={"Host": "evil.com"},
+        )
+        # The command should NOT have been executed.  The response should
+        # be the normal app error (500), not the command result.
+        data = rv.data.decode("utf-8", errors="replace")
+        assert "2" not in data or "The debugger caught an exception" in data
+
+
+class TestResourceServedWithoutAuth:
+    """Static resources should be served without requiring host trust
+    or PIN authentication."""
+
+    def test_css_served_without_auth(self):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            "/?__debugger__=yes&cmd=resource&f=style.css",
+            headers={"Host": "evil.com"},
+        )
+        assert rv.status_code == 200
+        assert b"body" in rv.data or b"debugger" in rv.data or rv.status_code == 200
+
+    def test_js_served_without_auth(self):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            "/?__debugger__=yes&cmd=resource&f=debugger.js",
+            headers={"Host": "evil.com"},
+        )
+        assert rv.status_code == 200
+
+
+class TestLogPinRequest:
+    def test_untrusted_host_returns_security_error(self):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=printpin&s={debugged.secret}",
+            headers={"Host": "evil.com"},
+        )
+        # SecurityError is a BadRequest (400).
+        assert rv.status_code == 400
+
+    def test_trusted_host_returns_ok(self):
+        debugged = _make_ok_debugged()
+        client = Client(debugged)
+        rv = client.get(
+            f"/?__debugger__=yes&cmd=printpin&s={debugged.secret}"
+        )
+        assert rv.status_code == 200

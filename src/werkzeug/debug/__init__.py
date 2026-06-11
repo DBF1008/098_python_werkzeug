@@ -357,10 +357,16 @@ class DebuggedApplication:
                 self.frame_contexts[id(frame)] = contexts
 
             is_trusted = bool(self.check_pin_trust(environ))
+            host_trusted = self.check_host_trust(environ)
+            # evalex_trusted requires BOTH host and PIN trust.  If the
+            # host is not trusted, the interactive features must not be
+            # advertised in the rendered HTML even when a valid PIN cookie
+            # exists — otherwise the JS enables the console but every
+            # command is rejected by the server with a SecurityError.
             html = tb.render_debugger_html(
-                evalex=self.evalex and self.check_host_trust(environ),
+                evalex=self.evalex and host_trusted,
                 secret=self.secret,
-                evalex_trusted=is_trusted,
+                evalex_trusted=host_trusted and is_trusted,
             )
             response = Response(html, status=500, mimetype="text/html")
 
@@ -384,9 +390,13 @@ class DebuggedApplication:
         request: Request,
         command: str,
         frame: DebugFrameSummary | _ConsoleFrame,
+        *,
+        host_trusted: bool | None = None,
     ) -> Response:
         """Execute a command in a console."""
-        if not self.check_host_trust(request.environ):
+        if host_trusted is None:
+            host_trusted = self.check_host_trust(request.environ)
+        if not host_trusted:
             return SecurityError()  # type: ignore[return-value]
 
         contexts = self.frame_contexts.get(id(frame), [])
@@ -397,9 +407,17 @@ class DebuggedApplication:
 
             return Response(frame.eval(command), mimetype="text/html")
 
-    def display_console(self, request: Request) -> Response:
+    def display_console(
+        self,
+        request: Request,
+        *,
+        host_trusted: bool | None = None,
+        pin_trusted: bool | None = None,
+    ) -> Response:
         """Display a standalone shell."""
-        if not self.check_host_trust(request.environ):
+        if host_trusted is None:
+            host_trusted = self.check_host_trust(request.environ)
+        if not host_trusted:
             return SecurityError()  # type: ignore[return-value]
 
         if 0 not in self.frames:
@@ -409,7 +427,12 @@ class DebuggedApplication:
                 ns = dict(self.console_init_func())
             ns.setdefault("app", self.app)
             self.frames[0] = _ConsoleFrame(ns)
-        is_trusted = bool(self.check_pin_trust(request.environ))
+        if pin_trusted is None:
+            pin_trusted = bool(self.check_pin_trust(request.environ))
+        # evalex_trusted requires BOTH host and PIN trust — if the host
+        # is not trusted the interactive features must not be enabled even
+        # when a valid PIN cookie exists.
+        is_trusted = host_trusted and pin_trusted
         return Response(
             render_console_html(secret=self.secret, evalex_trusted=is_trusted),
             mimetype="text/html",
@@ -469,9 +492,16 @@ class DebuggedApplication:
 
         time.sleep(5.0 if count > 5 else 0.5)
 
-    def pin_auth(self, request: Request) -> Response:
+    def pin_auth(
+        self,
+        request: Request,
+        *,
+        host_trusted: bool | None = None,
+    ) -> Response:
         """Authenticates with the pin."""
-        if not self.check_host_trust(request.environ):
+        if host_trusted is None:
+            host_trusted = self.check_host_trust(request.environ)
+        if not host_trusted:
             return SecurityError()  # type: ignore[return-value]
 
         exhausted = False
@@ -512,20 +542,44 @@ class DebuggedApplication:
             mimetype="application/json",
         )
         if auth:
+            # Determine the secure flag for the PIN cookie.  When behind a
+            # TLS-terminating reverse proxy, ``request.is_secure`` may not
+            # reflect the external connection scheme.  Check the first value
+            # of ``X-Forwarded-Proto`` as a secondary signal so that the
+            # cookie is marked ``Secure`` when the client-facing connection
+            # uses HTTPS, even if the proxy→backend link is plain HTTP.
+            is_secure = request.is_secure
+            if not is_secure:
+                forwarded_proto = request.environ.get(
+                    "HTTP_X_FORWARDED_PROTO", ""
+                )
+                if (
+                    forwarded_proto.strip().split(",")[0].strip().lower()
+                    == "https"
+                ):
+                    is_secure = True
+
             rv.set_cookie(
                 self.pin_cookie_name,
                 f"{int(time.time())}|{hash_pin(pin)}",
                 httponly=True,
                 samesite="Strict",
-                secure=request.is_secure,
+                secure=is_secure,
             )
         elif bad_cookie:
             rv.delete_cookie(self.pin_cookie_name)
         return rv
 
-    def log_pin_request(self, request: Request) -> Response:
+    def log_pin_request(
+        self,
+        request: Request,
+        *,
+        host_trusted: bool | None = None,
+    ) -> Response:
         """Log the pin if needed."""
-        if not self.check_host_trust(request.environ):
+        if host_trusted is None:
+            host_trusted = self.check_host_trust(request.environ)
+        if not host_trusted:
             return SecurityError()  # type: ignore[return-value]
 
         if self.pin_logging and self.pin is not None:
@@ -544,6 +598,15 @@ class DebuggedApplication:
         # any more!
         request = Request(environ)
         response = self.debug_application
+
+        # Compute trust decisions ONCE from the environ.  All handlers
+        # receive these pre-computed values so that host/PIN trust cannot
+        # diverge between the dispatch entry point and the individual
+        # handler — the root cause of the "page visible but console
+        # blocked" inconsistency in multi-proxy setups.
+        host_trusted = self.check_host_trust(environ)
+        pin_trusted = self.check_pin_trust(environ)
+
         if request.args.get("__debugger__") == "yes":
             cmd = request.args.get("cmd")
             arg = request.args.get("f")
@@ -552,21 +615,26 @@ class DebuggedApplication:
             if cmd == "resource" and arg:
                 response = self.get_resource(request, arg)  # type: ignore
             elif cmd == "pinauth" and secret == self.secret:
-                response = self.pin_auth(request)  # type: ignore
+                response = self.pin_auth(request, host_trusted=host_trusted)  # type: ignore
             elif cmd == "printpin" and secret == self.secret:
-                response = self.log_pin_request(request)  # type: ignore
+                response = self.log_pin_request(request, host_trusted=host_trusted)  # type: ignore
             elif (
                 self.evalex
+                and host_trusted
                 and cmd is not None
                 and frame is not None
                 and self.secret == secret
-                and self.check_pin_trust(environ)
+                and pin_trusted
             ):
-                response = self.execute_command(request, cmd, frame)  # type: ignore
+                response = self.execute_command(  # type: ignore
+                    request, cmd, frame, host_trusted=host_trusted
+                )
         elif (
             self.evalex
             and self.console_path is not None
             and request.path == self.console_path
         ):
-            response = self.display_console(request)  # type: ignore
+            response = self.display_console(  # type: ignore
+                request, host_trusted=host_trusted, pin_trusted=pin_trusted
+            )
         return response(environ, start_response)
