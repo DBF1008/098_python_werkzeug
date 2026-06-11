@@ -640,12 +640,9 @@ class Response:
         if not value:  # None or empty list
             del self.www_authenticate
         elif isinstance(value, list):
-            # Clear any existing header by setting the first item.
-            self.headers.set("WWW-Authenticate", value[0].to_header())
-
-            for item in value[1:]:
-                # Add additional header lines for additional items.
-                self.headers.add("WWW-Authenticate", item.to_header())
+            self.headers.setlist(
+                "WWW-Authenticate", [item.to_header() for item in value]
+            )
         else:
             self.headers.set("WWW-Authenticate", value.to_header())
 

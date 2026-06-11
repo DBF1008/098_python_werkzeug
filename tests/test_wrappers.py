@@ -1008,6 +1008,59 @@ def test_response_headers_passthrough():
     assert resp.headers is headers
 
 
+def test_response_update_preserves_multi_valued_headers():
+    """Regression: Response.headers.update() from a raw iterable of
+    ``(key, value)`` tuples must keep all values for duplicate keys
+    (e.g. multiple Set-Cookie headers), not only the last one.
+    """
+    resp = wrappers.Response()
+    resp.headers.update([
+        ("Set-Cookie", "session=abc"),
+        ("Set-Cookie", "theme=dark"),
+        ("X-Custom", "value"),
+    ])
+    assert resp.headers.getlist("Set-Cookie") == ["session=abc", "theme=dark"]
+    assert resp.headers["X-Custom"] == "value"
+
+
+def test_response_headers_round_trip_via_wsgi():
+    """Multi-valued headers survive the full path:
+    Response → get_wsgi_headers → to_wsgi_list → new Response.
+    """
+    resp = wrappers.Response("hello")
+    resp.headers.add("Set-Cookie", "a=1")
+    resp.headers.add("Set-Cookie", "b=2")
+
+    env = create_environ()
+    wsgi_headers = resp.get_wsgi_headers(env)
+    assert wsgi_headers.getlist("Set-Cookie") == ["a=1", "b=2"]
+
+    # Reconstruct a response from the WSGI header list
+    resp2 = wrappers.Response("world", headers=wsgi_headers.to_wsgi_list())
+    assert resp2.headers.getlist("Set-Cookie") == ["a=1", "b=2"]
+
+
+def test_www_authenticate_list_uses_setlist():
+    """Setting www_authenticate to a list must produce multiple header
+    lines (one per challenge), not combine them.
+    """
+    resp = wrappers.Response()
+    challenges = [
+        WWWAuthenticate("basic", {"realm": "Login"}),
+        WWWAuthenticate("bearer", {"realm": "API"}),
+    ]
+    resp.www_authenticate = challenges
+    assert resp.headers.getlist("WWW-Authenticate") == [
+        "Basic realm=Login",
+        "Bearer realm=API",
+    ]
+    # Overwrite with a single challenge must remove the second one
+    resp.www_authenticate = WWWAuthenticate("digest", {"realm": "Admin"})
+    assert resp.headers.getlist("WWW-Authenticate") == [
+        'Digest realm="Admin"'
+    ]
+
+
 def test_response_304_no_content_length():
     resp = wrappers.Response("Test", status=304)
     env = create_environ()

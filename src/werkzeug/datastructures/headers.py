@@ -493,13 +493,13 @@ class Headers:
             Headers
             | MultiDict[str, t.Any]
             | cabc.Mapping[
-                str, t.Any | list[t.Any] | tuple[t.Any, ...] | cabc.Set[t.Any]
+                str, t.Any | list[t.Any] | tuple[t.Any, ...] | set[t.Any]
             ]
             | cabc.Iterable[tuple[str, t.Any]]
             | None
         ) = None,
         /,
-        **kwargs: t.Any | list[t.Any] | tuple[t.Any, ...] | cabc.Set[t.Any],
+        **kwargs: t.Any | list[t.Any] | tuple[t.Any, ...] | set[t.Any],
     ) -> None:
         """Replace headers in this object with items from another
         headers object and keyword arguments.
@@ -511,32 +511,61 @@ class Headers:
         object, a :class:`MultiDict`, :class:`dict`, or iterable of
         pairs.
 
+        .. versionchanged:: 3.2
+            The ``arg`` parameter can be any iterable of ``(key, value)``
+            pairs.  Duplicate keys are preserved and replace any existing
+            values for that key, rather than only keeping the last value.
+
         .. versionadded:: 1.0
         """
-        if arg is not None:
-            if isinstance(arg, (Headers, MultiDict)):
-                for key in arg.keys():
-                    self.setlist(key, arg.getlist(key))
-            elif isinstance(arg, cabc.Mapping):
-                for key, value in arg.items():
-                    if isinstance(value, (list, tuple, set)):
-                        self.setlist(key, value)
-                    else:
-                        self.set(key, value)
-            else:
-                for key, value in arg:
-                    self.set(key, value)
+        self._merge_from(arg)
+        self._merge_from(kwargs)
 
-        for key, value in kwargs.items():
-            if isinstance(value, (list, tuple, set)):
-                self.setlist(key, value)
-            else:
-                self.set(key, value)
+    def _merge_from(
+        self,
+        source: (
+            Headers
+            | MultiDict[str, t.Any]
+            | cabc.Mapping[
+                str, t.Any | list[t.Any] | tuple[t.Any, ...] | set[t.Any]
+            ]
+            | cabc.Iterable[tuple[str, t.Any]]
+            | None
+        ),
+    ) -> None:
+        """Replace headers in this object from *source*, grouped by key.
+
+        Unlike sequential :meth:`set` calls (which lose earlier values
+        when the same key appears more than once), this collects all
+        values per key first and then applies them atomically with
+        :meth:`setlist`.  This preserves multi-valued headers from any
+        iterable source, including raw lists of ``(key, value)`` tuples.
+        """
+        if source is None:
+            return
+
+        if isinstance(source, (Headers, MultiDict)):
+            for key in source.keys():
+                self.setlist(key, source.getlist(key))
+        elif isinstance(source, cabc.Mapping):
+            for key, value in source.items():
+                if isinstance(value, (list, tuple, set)):
+                    self.setlist(key, value)
+                else:
+                    self.set(key, value)
+        else:
+            collected: dict[str, list[str]] = {}
+
+            for key, value in source:
+                collected.setdefault(key, []).append(_str_header_value(value))
+
+            for key, values in collected.items():
+                self.setlist(key, values)
 
     def __or__(
         self,
         other: cabc.Mapping[
-            str, t.Any | list[t.Any] | tuple[t.Any, ...] | cabc.Set[t.Any]
+            str, t.Any | list[t.Any] | tuple[t.Any, ...] | set[t.Any]
         ],
     ) -> te.Self:
         if not isinstance(other, cabc.Mapping):
@@ -549,14 +578,14 @@ class Headers:
     def __ior__(
         self,
         other: (
-            cabc.Mapping[str, t.Any | list[t.Any] | tuple[t.Any, ...] | cabc.Set[t.Any]]
+            cabc.Mapping[str, t.Any | list[t.Any] | tuple[t.Any, ...] | set[t.Any]]
             | cabc.Iterable[tuple[str, t.Any]]
         ),
     ) -> te.Self:
         if not isinstance(other, (cabc.Mapping, cabc.Iterable)):
             return NotImplemented
 
-        self.update(other)
+        self._merge_from(other)
         return self
 
     def to_wsgi_list(self) -> list[tuple[str, str]]:

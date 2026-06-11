@@ -615,6 +615,98 @@ class TestHeaders:
         with pytest.raises(TypeError):
             h.extend({"x": "x"}, {"x": "x"})
 
+    def test_update_with_iterable_preserves_multi_values(self):
+        """Headers.update() with a raw iterable of tuples must preserve
+        duplicate keys (e.g. multiple Set-Cookie headers) rather than
+        keeping only the last value per key.
+        """
+        h = self.storage_class()
+        h.update([
+            ("Set-Cookie", "a=1"),
+            ("Set-Cookie", "b=2"),
+            ("X-Other", "x"),
+        ])
+        assert h.getlist("Set-Cookie") == ["a=1", "b=2"]
+        assert h["X-Other"] == "x"
+
+    def test_update_with_multidict_preserves_multi_values(self):
+        md = ds.MultiDict([("X-A", "1"), ("X-A", "2"), ("X-B", "3")])
+        h = self.storage_class([("X-A", "old")])
+        h.update(md)
+        assert h.getlist("X-A") == ["1", "2"]
+        assert h["X-B"] == "3"
+
+    def test_update_replaces_existing_multi_valued(self):
+        """update() must *replace* (not extend) existing values."""
+        h = self.storage_class([
+            ("Set-Cookie", "old1"),
+            ("Set-Cookie", "old2"),
+        ])
+        h.update([("Set-Cookie", "new1"), ("Set-Cookie", "new2")])
+        assert h.getlist("Set-Cookie") == ["new1", "new2"]
+
+    def test_update_order_preserved(self):
+        """update() groups values by key (consistent with the Headers
+        and MultiDict paths).  Keys appear in first-seen order; all
+        values for a key are placed together.
+        """
+        h = self.storage_class()
+        h.update([
+            ("X-A", "1"),
+            ("X-B", "2"),
+            ("X-A", "3"),
+        ])
+        assert list(h) == [("X-A", "1"), ("X-A", "3"), ("X-B", "2")]
+
+    def test_update_kwargs_list_values(self):
+        h = self.storage_class()
+        h.update(**{"Set-Cookie": ["a=1", "b=2"]})
+        assert h.getlist("Set-Cookie") == ["a=1", "b=2"]
+
+    def test_ior_with_iterable_preserves_multi_values(self):
+        h = self.storage_class([("X-Old", "old")])
+        h |= [("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")]
+        assert h.getlist("Set-Cookie") == ["a=1", "b=2"]
+        assert h["X-Old"] == "old"  # keys not in source are preserved
+
+    def test_or_preserves_multi_values(self):
+        base = self.storage_class([("X-Base", "1")])
+        result = base | {"Set-Cookie": ["a=1", "b=2"]}
+        assert result.getlist("Set-Cookie") == ["a=1", "b=2"]
+        assert result["X-Base"] == "1"
+
+    def test_headers_round_trip_via_update(self):
+        """Simulate request → response header transfer via update()."""
+        # Request-like source with multi-valued headers
+        source = self.storage_class([
+            ("Accept", "text/html"),
+            ("Set-Cookie", "session=abc"),
+            ("Set-Cookie", "theme=dark"),
+            ("X-Forwarded-For", "1.2.3.4"),
+        ])
+
+        # Response starts with its own headers
+        target = self.storage_class([("Content-Type", "text/plain")])
+        target.update(source)
+
+        assert target.getlist("Set-Cookie") == ["session=abc", "theme=dark"]
+        assert target["Accept"] == "text/html"
+        assert target["X-Forwarded-For"] == "1.2.3.4"
+        assert target["Content-Type"] == "text/plain"
+
+    def test_copy_preserves_multi_values(self):
+        h = self.storage_class([
+            ("Set-Cookie", "a=1"),
+            ("Set-Cookie", "b=2"),
+        ])
+        h2 = h.copy()
+        assert h2.getlist("Set-Cookie") == ["a=1", "b=2"]
+
+    def test_extend_preserves_multi_values(self):
+        h = self.storage_class([("Set-Cookie", "a=1")])
+        h.extend([("Set-Cookie", "b=2"), ("Set-Cookie", "c=3")])
+        assert h.getlist("Set-Cookie") == ["a=1", "b=2", "c=3"]
+
     def test_setlist(self):
         h = self.storage_class([("a", "0"), ("b", "1"), ("c", "2")])
         h.setlist("b", ["3", "4"])
