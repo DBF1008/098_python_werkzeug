@@ -386,9 +386,6 @@ class DebuggedApplication:
         frame: DebugFrameSummary | _ConsoleFrame,
     ) -> Response:
         """Execute a command in a console."""
-        if not self.check_host_trust(request.environ):
-            return SecurityError()  # type: ignore[return-value]
-
         contexts = self.frame_contexts.get(id(frame), [])
 
         with ExitStack() as exit_stack:
@@ -399,9 +396,6 @@ class DebuggedApplication:
 
     def display_console(self, request: Request) -> Response:
         """Display a standalone shell."""
-        if not self.check_host_trust(request.environ):
-            return SecurityError()  # type: ignore[return-value]
-
         if 0 not in self.frames:
             if self.console_init_func is None:
                 ns = {}
@@ -471,9 +465,6 @@ class DebuggedApplication:
 
     def pin_auth(self, request: Request) -> Response:
         """Authenticates with the pin."""
-        if not self.check_host_trust(request.environ):
-            return SecurityError()  # type: ignore[return-value]
-
         exhausted = False
         auth = False
         trust = self.check_pin_trust(request.environ)
@@ -525,9 +516,6 @@ class DebuggedApplication:
 
     def log_pin_request(self, request: Request) -> Response:
         """Log the pin if needed."""
-        if not self.check_host_trust(request.environ):
-            return SecurityError()  # type: ignore[return-value]
-
         if self.pin_logging and self.pin is not None:
             _log(
                 "info", " * To enable the debugger you need to enter the security pin:"
@@ -552,14 +540,21 @@ class DebuggedApplication:
             if cmd == "resource" and arg:
                 response = self.get_resource(request, arg)  # type: ignore
             elif cmd == "pinauth" and secret == self.secret:
-                response = self.pin_auth(request)  # type: ignore
+                if not self.check_host_trust(environ):
+                    response = SecurityError()  # type: ignore[assignment]
+                else:
+                    response = self.pin_auth(request)  # type: ignore
             elif cmd == "printpin" and secret == self.secret:
-                response = self.log_pin_request(request)  # type: ignore
+                if not self.check_host_trust(environ):
+                    response = SecurityError()  # type: ignore[assignment]
+                else:
+                    response = self.log_pin_request(request)  # type: ignore
             elif (
                 self.evalex
                 and cmd is not None
                 and frame is not None
                 and self.secret == secret
+                and self.check_host_trust(environ)
                 and self.check_pin_trust(environ)
             ):
                 response = self.execute_command(request, cmd, frame)  # type: ignore
@@ -568,5 +563,8 @@ class DebuggedApplication:
             and self.console_path is not None
             and request.path == self.console_path
         ):
-            response = self.display_console(request)  # type: ignore
+            if not self.check_host_trust(environ):
+                response = SecurityError()  # type: ignore[assignment]
+            else:
+                response = self.display_console(request)  # type: ignore
         return response(environ, start_response)

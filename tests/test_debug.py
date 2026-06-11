@@ -1,3 +1,4 @@
+import json
 import linecache
 import re
 import sys
@@ -316,3 +317,114 @@ def test_debugged_application_pin_security_false():
     # This should not raise AttributeError
     debugged = DebuggedApplication(app, evalex=True, pin_security=False)
     assert debugged.pin is None
+
+
+class TestDebuggedApplicationTrust:
+    @staticmethod
+    def _get_app(pin_security=False, trusted_hosts=None):
+        @Request.application
+        def app(request):
+            raise ValueError("test error")
+
+        debugged = DebuggedApplication(app, evalex=True, pin_security=pin_security)
+        if trusted_hosts is not None:
+            debugged.trusted_hosts = trusted_hosts
+        client = Client(debugged)
+        client.get("/")
+        return debugged, client
+
+    def test_default_trusted_hosts(self):
+        @Request.application
+        def app(request):
+            return "OK"
+
+        debugged = DebuggedApplication(app, evalex=True, pin_security=False)
+        assert debugged.trusted_hosts == [".localhost", "127.0.0.1"]
+        assert debugged.check_host_trust({"HTTP_HOST": "localhost"})
+        assert debugged.check_host_trust({"HTTP_HOST": "127.0.0.1"})
+        assert debugged.check_host_trust({"HTTP_HOST": "sub.localhost"})
+        assert not debugged.check_host_trust({"HTTP_HOST": "example.com"})
+        assert not debugged.check_host_trust({"HTTP_HOST": ""})
+
+    def test_resource_accessible_from_untrusted_host(self):
+        debugged, client = self._get_app(trusted_hosts=["trustedonly.com"])
+        response = client.get(
+            "/?__debugger__=yes&cmd=resource&f=style.css",
+            environ_overrides={"HTTP_HOST": "evil.com"},
+        )
+        assert response.status_code == 200
+
+    def test_evalex_blocked_from_untrusted_host(self):
+        debugged, client = self._get_app(trusted_hosts=["localhost"])
+        frame_id = next(iter(debugged.frames))
+        secret = debugged.secret
+        response = client.get(
+            f"/?__debugger__=yes&cmd=print(1)&frm={frame_id}&s={secret}",
+            environ_overrides={"HTTP_HOST": "evil.com"},
+        )
+        assert response.status_code != 200
+
+    def test_evalex_allowed_from_trusted_host(self):
+        debugged, client = self._get_app(trusted_hosts=[".localhost"])
+        frame_id = next(iter(debugged.frames))
+        secret = debugged.secret
+        response = client.get(
+            f"/?__debugger__=yes&cmd=print(1)&frm={frame_id}&s={secret}",
+        )
+        assert response.status_code == 200
+
+    def test_pinauth_blocked_from_untrusted_host(self):
+        debugged, client = self._get_app(
+            pin_security=True, trusted_hosts=["localhost"]
+        )
+        secret = debugged.secret
+        response = client.get(
+            f"/?__debugger__=yes&cmd=pinauth&s={secret}&pin=1234",
+            environ_overrides={"HTTP_HOST": "evil.com"},
+        )
+        assert response.status_code == 400
+
+    def test_printpin_blocked_from_untrusted_host(self):
+        debugged, client = self._get_app(
+            pin_security=True, trusted_hosts=["localhost"]
+        )
+        secret = debugged.secret
+        response = client.get(
+            f"/?__debugger__=yes&cmd=printpin&s={secret}",
+            environ_overrides={"HTTP_HOST": "evil.com"},
+        )
+        assert response.status_code == 400
+
+    def test_console_blocked_from_untrusted_host(self):
+        debugged, client = self._get_app(trusted_hosts=["trustedonly.com"])
+        response = client.get(
+            "/console",
+            environ_overrides={"HTTP_HOST": "evil.com"},
+        )
+        assert response.status_code == 400
+
+    def test_console_allowed_from_trusted_host(self):
+        debugged, client = self._get_app(trusted_hosts=[".localhost"])
+        response = client.get("/console")
+        assert response.status_code == 200
+
+    def test_traceback_renders_for_untrusted_host(self):
+        debugged, _ = self._get_app(trusted_hosts=["trustedonly.com"])
+        client = Client(debugged)
+        response = client.get("/", environ_overrides={"HTTP_HOST": "evil.com"})
+        assert response.status_code == 500
+        data = response.get_data(as_text=True)
+        assert "test error" in data
+
+    def test_pinauth_allowed_from_trusted_host(self):
+        debugged, client = self._get_app(
+            pin_security=True, trusted_hosts=[".localhost"]
+        )
+        secret = debugged.secret
+        pin = debugged.pin
+        response = client.get(
+            f"/?__debugger__=yes&cmd=pinauth&s={secret}&pin={pin}",
+        )
+        assert response.status_code == 200
+        data = json.loads(response.get_data(as_text=True))
+        assert data["auth"] is True
