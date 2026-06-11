@@ -390,11 +390,65 @@ class MultiPartParser:
         self._files.append(container)
         return container
 
+    def _finalize_field(
+        self, part: Field, chunks: list[bytes], fields: list[tuple[str, str]]
+    ) -> None:
+        """Decode accumulated field data chunks and append to *fields*."""
+        value = b"".join(chunks).decode(
+            self.get_part_charset(part.headers), "replace"
+        )
+        fields.append((part.name, value))
+
+    def _finalize_file(
+        self,
+        part: File,
+        stream: t.IO[bytes],
+        files: list[tuple[str, FileStorage]],
+    ) -> None:
+        """Wrap a completed file stream in :class:`FileStorage` and
+        append to *files*.
+        """
+        stream.seek(0)
+        files.append(
+            (
+                part.name,
+                FileStorage(
+                    stream,
+                    part.filename,
+                    part.name,
+                    headers=part.headers,
+                ),
+            )
+        )
+
+    def _check_field_size(self, data_len: int, field_size: int) -> int:
+        """Track accumulated field data size. Returns updated *field_size*.
+
+        :raises RequestEntityTooLarge: If *field_size* exceeds
+            ``max_form_memory_size``.
+        """
+        field_size += data_len
+        if field_size > self.max_form_memory_size:  # type: ignore[operator]
+            raise RequestEntityTooLarge()
+        return field_size
+
     def parse(
         self, stream: t.IO[bytes], boundary: bytes, content_length: int | None
     ) -> tuple[MultiDict[str, str], MultiDict[str, FileStorage]]:
+        """Parse a multipart stream into form fields and files.
+
+        The parser reads data in chunks (controlled by ``buffer_size``)
+        and feeds it to :class:`~werkzeug.sansio.multipart.MultipartDecoder`.
+        Events are consumed in order:
+
+        - ``Field`` → data accumulated in memory, subject to
+          ``max_form_memory_size``.
+        - ``File`` → data written to a temporary file stream via
+          ``stream_factory``. Not subject to ``max_form_memory_size``.
+        - ``Data`` → body bytes for the current field or file part.
+        """
         current_part: Field | File
-        field_size: int | None = None
+        field_size: int = 0
         container: t.IO[bytes] | list[bytes]
         _write: t.Callable[[bytes], t.Any]
 
@@ -404,8 +458,8 @@ class MultiPartParser:
             max_parts=self.max_form_parts,
         )
 
-        fields = []
-        files = []
+        fields: list[tuple[str, str]] = []
+        files: list[tuple[str, FileStorage]] = []
 
         for data in _chunk_iter(stream.read, self.buffer_size):
             parser.receive_data(data)
@@ -418,38 +472,35 @@ class MultiPartParser:
                     _write = container.append
                 elif isinstance(event, File):
                     current_part = event
-                    field_size = None
                     container = self.start_file_streaming(event, content_length)
                     _write = container.write
                 elif isinstance(event, Data):
-                    if self.max_form_memory_size is not None and field_size is not None:
-                        # Ensure that accumulated data events do not exceed limit.
-                        # Also checked within single event in MultipartDecoder.
-                        field_size += len(event.data)
-
-                        if field_size > self.max_form_memory_size:
-                            raise RequestEntityTooLarge()
+                    # Enforce max_form_memory_size only for Field parts.
+                    # File data is written to a temp stream and is not
+                    # limited by this setting.
+                    if (
+                        self.max_form_memory_size is not None
+                        and isinstance(current_part, Field)
+                    ):
+                        field_size = self._check_field_size(
+                            len(event.data), field_size
+                        )
 
                     _write(event.data)
+
                     if not event.more_data:
+                        # Part body is complete — finalize.
                         if isinstance(current_part, Field):
-                            value = b"".join(container).decode(
-                                self.get_part_charset(current_part.headers), "replace"
+                            self._finalize_field(
+                                current_part,
+                                t.cast("list[bytes]", container),
+                                fields,
                             )
-                            fields.append((current_part.name, value))
                         else:
-                            container = t.cast(t.IO[bytes], container)
-                            container.seek(0)
-                            files.append(
-                                (
-                                    current_part.name,
-                                    FileStorage(
-                                        container,
-                                        current_part.filename,
-                                        current_part.name,
-                                        headers=current_part.headers,
-                                    ),
-                                )
+                            self._finalize_file(
+                                current_part,
+                                t.cast("t.IO[bytes]", container),
+                                files,
                             )
 
                 event = parser.next_event()

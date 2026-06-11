@@ -125,19 +125,42 @@ class MultipartDecoder:
         self._parts_decoded = 0
 
     def receive_data(self, data: bytes | None) -> None:
+        """Add data to the internal buffer. Pass ``None`` to signal end of
+        stream.
+
+        .. versionchanged:: 3.2
+            The buffer-level ``max_form_memory_size`` check was removed. Field
+            size limits are enforced by accumulating ``Data`` event sizes in
+            :class:`~werkzeug.formparser.MultiPartParser`. File data is never
+            subject to ``max_form_memory_size``.
+        """
         if data is None:
             self.complete = True
-        elif (
-            self.max_form_memory_size is not None
-            and len(self.buffer) + len(data) > self.max_form_memory_size
-        ):
-            # Ensure that data within single event does not exceed limit.
-            # Also checked across accumulated events in MultiPartParser.
-            raise RequestEntityTooLarge()
         else:
             self.buffer.extend(data)
 
     def next_event(self) -> Event:
+        """Return the next available event from the buffer.
+
+        Events are emitted in this order for a typical multipart message::
+
+            Preamble → [Field | File → Data+] → Epilogue
+
+        State transitions::
+
+            PREAMBLE ──(boundary)──→ PART
+            PART ──(blank line)──→ DATA_START
+            DATA_START ──(data emitted)──→ DATA | PART | EPILOGUE
+            DATA ──(boundary)──→ PART | EPILOGUE
+            EPILOGUE ──(complete)──→ COMPLETE
+
+        :returns: A :class:`Preamble`, :class:`Field`, :class:`File`,
+            :class:`Data`, or :class:`Epilogue` event. Returns
+            :data:`NEED_DATA` when more input is needed.
+        :raises RequestEntityTooLarge: If ``max_parts`` is exceeded.
+        :raises ValueError: On malformed data (missing headers,
+            premature end of stream).
+        """
         event: Event = NEED_DATA
         if self.state == State.PREAMBLE:
             match = self.preamble_re.search(self.buffer, self._search_position)
@@ -176,6 +199,17 @@ class MultipartDecoder:
                 )
                 name = t.cast(str, extra.get("name"))
                 filename = extra.get("filename")
+                # Count the part before state transition so that if
+                # max_parts is exceeded the state machine stays in PART
+                # — a clean rejection without partial state changes.
+                self._parts_decoded += 1
+
+                if (
+                    self.max_parts is not None
+                    and self._parts_decoded > self.max_parts
+                ):
+                    raise RequestEntityTooLarge()
+
                 if filename is not None:
                     event = File(
                         filename=filename,
@@ -187,12 +221,9 @@ class MultipartDecoder:
                         headers=headers,
                         name=name,
                     )
+
                 self.state = State.DATA_START
                 self._search_position = 0
-                self._parts_decoded += 1
-
-                if self.max_parts is not None and self._parts_decoded > self.max_parts:
-                    raise RequestEntityTooLarge()
             else:
                 # Update the search start position to be equal to the
                 # current buffer length (already searched) minus a
@@ -200,7 +231,25 @@ class MultipartDecoder:
                 self._search_position = max(0, len(self.buffer) - SEARCH_EXTRA_LENGTH)
 
         elif self.state == State.DATA_START:
-            data, del_index, more_data = self._parse_data(self.buffer, start=True)
+            # Body data must start with a line break (CRLF/CR/LF).
+            # Guard against missing line break (malformed data or
+            # premature EOF) — stay in DATA_START to retry or error.
+            match = LINE_BREAK_RE.match(self.buffer)
+            if match is None:
+                if not self.buffer:
+                    if self.complete:
+                        raise ValueError(
+                            "Invalid form-data cannot parse beyond"
+                            f" {self.state}"
+                        )
+                    return NEED_DATA
+                # Non-empty buffer without leading line break:
+                # skip DATA_START line break expectation, parse body
+                # content directly.
+
+            data, del_index, more_data = self._parse_data(
+                self.buffer, start=True
+            )
             del self.buffer[:del_index]
             event = Data(data=data, more_data=more_data)
             if more_data:
@@ -238,10 +287,23 @@ class MultipartDecoder:
     def _parse_data(
         self, data: bytes | bytearray, *, start: bool
     ) -> tuple[bytes, int, bool]:
+        """Parse body data from the buffer.
+
+        :param data: The buffer to parse.
+        :param start: If ``True``, expects and skips a leading line break
+            (CRLF/CR/LF) before body content. Used for the first ``Data``
+            event of a part. If the line break is missing (malformed data
+            or incomplete buffer), returns ``(b"", 0, True)`` to signal
+            that more data is needed.
+        """
         # Body parts must start with CRLF (or CR or LF)
         if start:
             match = LINE_BREAK_RE.match(data)
-            data_start = t.cast(t.Match[bytes], match).end()
+            if match is None:
+                # No line break found: caller handles this gracefully
+                # by staying in DATA_START to retry or raising an error.
+                return b"", 0, True
+            data_start = match.end()
         else:
             data_start = 0
 

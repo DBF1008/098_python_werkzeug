@@ -464,3 +464,147 @@ def test_multipart_max_form_memory_size() -> None:
 
     with pytest.raises(RequestEntityTooLarge):
         parser.parse(io.BytesIO(data), b"bound", None)
+
+
+def test_max_form_memory_size_ignores_file_data() -> None:
+    """max_form_memory_size applies only to Field parts, not File parts.
+
+    Previously the buffer-level check in MultipartDecoder.receive_data()
+    would incorrectly reject file uploads when a single read() call
+    exceeded max_form_memory_size.
+    """
+    # File part with 200 bytes of data, max_form_memory_size=100.
+    # The file should be accepted because max_form_memory_size only
+    # limits in-memory field data.
+    data = (
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="upload"; filename="big.bin"\r\n'
+        b"Content-Type: application/octet-stream\r\n\r\n"
+        + b"x" * 200
+        + b"\r\n--foo--"
+    )
+    # Use a buffer_size larger than max_form_memory_size to ensure the
+    # entire file comes in one chunk.
+    with formparser.MultiPartParser(
+        max_form_memory_size=100, buffer_size=1024
+    ) as parser:
+        form, files = parser.parse(io.BytesIO(data), b"foo", None)
+    assert "upload" in files
+    assert files["upload"].read() == b"x" * 200
+    files["upload"].close()
+
+
+def test_max_form_memory_size_chunk_boundary_consistent() -> None:
+    """max_form_memory_size fires consistently regardless of chunk alignment.
+
+    Previously, the buffer-level check in receive_data() interacted with
+    the per-field check in MultiPartParser.parse() in chunk-dependent
+    ways, causing the error to fire at different points (or not at all)
+    depending on buffer_size.
+    """
+    field_value = b"a" * 20
+    data = (
+        b"--bound\r\n"
+        b'Content-Disposition: form-data; name="field"\r\n\r\n'
+        + field_value
+        + b"\r\n--bound--"
+    )
+    max_size = 10  # Less than field_value length (20)
+
+    # Test with various buffer sizes — all should raise
+    # RequestEntityTooLarge because the field exceeds max_size.
+    for buf_size in [5, 8, 13, 21, 50, 128, 4096]:
+        parser = formparser.MultiPartParser(
+            max_form_memory_size=max_size, buffer_size=buf_size
+        )
+        with pytest.raises(RequestEntityTooLarge):
+            parser.parse(io.BytesIO(data), b"bound", None)
+
+
+def test_max_form_parts_state_consistency() -> None:
+    """When max_form_parts is exceeded, the parser is in a clean state.
+
+    Previously, the state machine transitioned to DATA_START before
+    checking max_parts, leaving it in a half-transitioned state when
+    RequestEntityTooLarge was raised.
+    """
+    data = (
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="a"\r\n\r\nval_a\r\n'
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="b"\r\n\r\nval_b\r\n'
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="c"\r\n\r\nval_c\r\n'
+        b"--foo--"
+    )
+    parser = formparser.MultiPartParser(max_form_parts=2)
+    with pytest.raises(RequestEntityTooLarge):
+        parser.parse(io.BytesIO(data), b"foo", None)
+
+
+def test_silent_mode_does_not_swallow_request_entity_too_large() -> None:
+    """FormDataParser with silent=True catches ValueError but NOT
+    RequestEntityTooLarge.
+
+    This documents that silent mode only handles malformed data
+    (missing boundaries, bad headers), not size limit violations.
+    """
+    data = (
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="a"\r\n\r\nval_a\r\n'
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="b"\r\n\r\nval_b\r\n'
+        b"--foo--"
+    )
+
+    # max_form_parts=1 with silent=True should still raise RETL.
+    parser = FormDataParser(silent=True, max_form_parts=1)
+    environ = {
+        "REQUEST_METHOD": "POST",
+        "CONTENT_TYPE": "multipart/form-data; boundary=foo",
+        "CONTENT_LENGTH": str(len(data)),
+        "wsgi.input": io.BytesIO(data),
+    }
+    with pytest.raises(RequestEntityTooLarge):
+        parser.parse_from_environ(environ)
+
+    # max_form_memory_size exceeded with silent=True should still raise.
+    data2 = (
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="a"\r\n\r\n'
+        + b"x" * 50
+        + b"\r\n--foo--"
+    )
+    parser2 = FormDataParser(silent=True, max_form_memory_size=10)
+    environ2 = {
+        "REQUEST_METHOD": "POST",
+        "CONTENT_TYPE": "multipart/form-data; boundary=foo",
+        "CONTENT_LENGTH": str(len(data2)),
+        "wsgi.input": io.BytesIO(data2),
+    }
+    with pytest.raises(RequestEntityTooLarge):
+        parser2.parse_from_environ(environ2)
+
+
+def test_multipart_field_and_file_mixed_with_max_form_memory_size() -> None:
+    """A multipart body with both a small field and a large file should
+    succeed when max_form_memory_size exceeds the field but not the file.
+    """
+    data = (
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="name"\r\n\r\nAlice\r\n'
+        b"--foo\r\n"
+        b'Content-Disposition: form-data; name="avatar"; filename="a.bin"\r\n'
+        b"Content-Type: application/octet-stream\r\n\r\n"
+        + b"\x00" * 500
+        + b"\r\n--foo--"
+    )
+    # max_form_memory_size=100 is larger than "Alice" (5 bytes)
+    # but smaller than the file (500 bytes). File should not trigger.
+    with formparser.MultiPartParser(
+        max_form_memory_size=100, buffer_size=256
+    ) as parser:
+        form, files = parser.parse(io.BytesIO(data), b"foo", None)
+    assert form["name"] == "Alice"
+    assert files["avatar"].read() == b"\x00" * 500
+    files["avatar"].close()
