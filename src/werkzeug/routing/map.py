@@ -37,6 +37,39 @@ if t.TYPE_CHECKING:
     from .rules import RuleFactory
 
 
+def _normalize_server_name(name: str, scheme: str) -> str:
+    """Normalize a server name for routing.
+
+    Lowercases, strips standard ports based on scheme, and IDNA-encodes
+    the hostname portion. This is the single source of truth for server
+    name normalization used by both :meth:`Map.bind` and
+    :meth:`Map.bind_to_environ`.
+
+    :param name: The ``host:port`` string to normalize.
+    :param scheme: The URL scheme, used to determine whether to strip
+        standard ports (80 for http/ws, 443 for https/wss).
+    :return: Normalized ``host:port`` string with IDNA-encoded hostname.
+    :raises BadHost: If the hostname cannot be IDNA-encoded.
+
+    .. versionadded:: 3.2
+    """
+    # Port isn't part of IDNA, and might push a name over the 63 octet limit.
+    hostname, sep, port = name.lower().partition(":")
+
+    # Strip standard ports based on scheme, matching sansio/utils.get_host().
+    if scheme in {"http", "ws"} and port == "80":
+        sep = port = ""
+    elif scheme in {"https", "wss"} and port == "443":
+        sep = port = ""
+
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as e:
+        raise BadHost() from e
+
+    return f"{hostname}{sep}{port}"
+
+
 class Map:
     """The map class stores all the URL rules and some configuration
     parameters.  Some of the configuration values are only stored on the
@@ -68,8 +101,9 @@ class Map:
     :param subdomain_matching: Whether to detect the subdomain from ``Host`` and
         ``server_name``, and route based on it. Uses the ``subdomain`` parameter
         of each :class:`Rule`, which defaults to ``default_subdomain``, which
-        defaults to empty. Enabled by default, but always disabled if
-        ``host_matching`` is enabled.
+        defaults to empty. Enabled by default. Can be used together with
+        ``host_matching``; in that case host matching takes priority for
+        matching, and subdomain information is used for URL building.
 
     .. versionchanged:: 3.2
         The ``subdomain_matching`` parameter was added.
@@ -120,7 +154,7 @@ class Map:
         self.default_subdomain = default_subdomain
         self.strict_slashes = strict_slashes
         self.redirect_defaults = redirect_defaults
-        self.subdomain_matching = subdomain_matching and not host_matching
+        self.subdomain_matching = subdomain_matching
         self.host_matching = host_matching
 
         self.converters = self.default_converters.copy()
@@ -235,11 +269,13 @@ class Map:
         .. versionchanged:: 0.7
             Added ``query_args``.
         """
-        if self.host_matching:
+        if self.host_matching and not self.subdomain_matching:
             if subdomain is not None:
                 raise RuntimeError(
-                    "Passing 'subdomain' is invalid when host matching is enabled."
+                    "Passing 'subdomain' is invalid when host matching"
+                    " is enabled without subdomain matching."
                 )
+            subdomain = ""
         elif subdomain is None:
             subdomain = self.default_subdomain
 
@@ -249,18 +285,12 @@ class Map:
         if path_info is None:
             path_info = "/"
 
-        # Port isn't part of IDNA, and might push a name over the 63 octet limit.
-        server_name, port_sep, port = server_name.lower().partition(":")
-
-        try:
-            server_name = server_name.encode("idna").decode("ascii")
-        except UnicodeError as e:
-            raise BadHost() from e
+        server_name = _normalize_server_name(server_name, url_scheme)
 
         return MapAdapter(
             map=self,
             url_scheme=url_scheme,
-            server_name=f"{server_name}{port_sep}{port}",
+            server_name=server_name,
             subdomain=subdomain,
             default_method=default_method,
             script_name=script_name,
@@ -343,23 +373,30 @@ class Map:
         if upgrade and env.get("HTTP_UPGRADE", "").lower() == "websocket":
             scheme = "wss" if scheme == "https" else "ws"
 
-        if server_name is None or self.host_matching:
-            server_name = wsgi_server_name
+        # --- Resolve adapter server_name (used for matching & external URLs) ---
+        # When host_matching, the adapter always stores the actual request host.
+        # Otherwise, use the explicitly provided server_name or fall back to
+        # the request host.
+        if self.host_matching:
+            adapter_server_name = _normalize_server_name(wsgi_server_name, scheme)
+        elif server_name is not None:
+            adapter_server_name = _normalize_server_name(server_name, scheme)
         else:
-            server_name = server_name.lower()
+            adapter_server_name = _normalize_server_name(wsgi_server_name, scheme)
 
-            # strip standard port to match get_host()
-            if scheme in {"http", "ws"} and server_name.endswith(":80"):
-                server_name = server_name[:-3]
-            elif scheme in {"https", "wss"} and server_name.endswith(":443"):
-                server_name = server_name[:-4]
+        # --- Determine base domain for subdomain extraction ---
+        if server_name is not None:
+            base_for_subdomain = _normalize_server_name(server_name, scheme)
+        else:
+            base_for_subdomain = adapter_server_name
 
+        # --- Extract subdomain ---
         if subdomain is None and self.subdomain_matching:
-            cur_server_name = wsgi_server_name.split(".")
-            real_server_name = server_name.split(".")
-            offset = -len(real_server_name)
+            cur_parts = wsgi_server_name.lower().split(".")
+            base_parts = base_for_subdomain.split(".")
+            offset = -len(base_parts)
 
-            if cur_server_name[offset:] != real_server_name:
+            if cur_parts[offset:] != base_parts:
                 # Host does not have server_name as a suffix. This can happen if
                 # the server was accessed by IP, or other names point to it in
                 # DNS. bind will use default_subdomain.
@@ -368,17 +405,18 @@ class Map:
                     " matching is enabled. Using configured default"
                     f" {self.default_subdomain!r}.\n"
                     f"Current server name {wsgi_server_name!r} isn't under"
-                    f" configured server name {server_name!r}.",
+                    f" configured server name {base_for_subdomain!r}.",
                     stacklevel=2,
                 )
+                subdomain = self.default_subdomain
             else:
                 # Remove server_name as a suffix from Host to get the subdomain.
-                subdomain = ".".join(cur_server_name[:offset])
+                subdomain = ".".join(cur_parts[:offset])
 
         return self.bind(
             url_scheme=scheme,
             subdomain=subdomain,
-            server_name=server_name,
+            server_name=adapter_server_name,
             default_method=env["REQUEST_METHOD"],
             script_name=_get_wsgi_string(env, "SCRIPT_NAME"),
             path_info=_get_wsgi_string(env, "PATH_INFO"),
@@ -633,10 +671,10 @@ class MapAdapter:
         if websocket is None:
             websocket = self.websocket
 
-        if self.map.subdomain_matching:
-            domain_part = self.subdomain
-        elif self.map.host_matching:
+        if self.map.host_matching:
             domain_part = self.server_name
+        elif self.map.subdomain_matching:
+            domain_part = self.subdomain
         else:
             domain_part = ""
 
@@ -960,15 +998,17 @@ class MapAdapter:
 
         # Return a plain path if neither host or subdomain matching is enabled,
         # or if they are enabled and the current host matches.
-        if (
-            not force_external
-            and (self.map.subdomain_matching or self.map.host_matching)
-            and (
-                (self.map.subdomain_matching and domain_part == self.subdomain)
-                or (self.map.host_matching and host == self.server_name)
-            )
+        if not force_external and (
+            self.map.subdomain_matching or self.map.host_matching
         ):
-            return f"{self.script_name.rstrip('/')}/{path.lstrip('/')}"
+            same_host = False
+            if self.map.host_matching:
+                same_host = host == self.server_name
+            elif self.map.subdomain_matching:
+                same_host = domain_part == self.subdomain
+
+            if same_host:
+                return f"{self.script_name.rstrip('/')}/{path.lstrip('/')}"
 
         scheme = f"{url_scheme}:" if url_scheme else ""
         return f"{scheme}//{host}{self.script_name[:-1]}/{path.lstrip('/')}"

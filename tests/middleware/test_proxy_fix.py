@@ -192,3 +192,105 @@ def test_proxy_fix(monkeypatch, kwargs, base, url_root):
 
     response = Client(app).open(Request(environ))
     assert response.location == f"{url_root}parrot"
+
+
+def test_proxy_fix_host_and_subdomain_matching():
+    """ProxyFix adjusts environ, then routing with both host_matching and
+    subdomain_matching works correctly. Match uses the proxy-rewritten host,
+    and build also produces correct URLs based on the same adapter state."""
+
+    url_map = Map(
+        [
+            Rule("/", host="app.example.com", endpoint="index"),
+            Rule("/", host="<sub>.app.example.com", endpoint="sub"),
+            Rule("/page", host="app.example.com", endpoint="page"),
+        ],
+        host_matching=True,
+        subdomain_matching=True,
+    )
+
+    @Request.application
+    def app(request):
+        urls = url_map.bind_to_environ(
+            request.environ, server_name="app.example.com"
+        )
+
+        # Adapter should have the proxy-rewritten host
+        assert urls.server_name == "de.app.example.com"
+        # Subdomain should be extracted from the proxy-rewritten host
+        assert urls.subdomain == "de"
+
+        # Match uses the full host (host_matching behavior)
+        endpoint, values = urls.match("/")
+        assert endpoint == "sub"
+        assert values == {"sub": "de"}
+
+        # Build for same host returns relative URL
+        assert urls.build("sub", {"sub": "de"}) == "/"
+        # Build for different host returns absolute URL
+        assert urls.build("sub", {"sub": "fr"}) == "http://fr.app.example.com/"
+        # Build for base host returns absolute URL (different from current host)
+        assert urls.build("index") == "http://app.example.com/"
+
+        return Response("ok")
+
+    app = ProxyFix(app, x_host=1)
+
+    environ = create_environ(
+        "/",
+        base_url="http://internal.proxy",
+        environ_overrides={
+            "HTTP_X_FORWARDED_HOST": "de.app.example.com",
+        },
+    )
+
+    response = Client(app).open(Request(environ))
+    assert response.data == b"ok"
+
+
+def test_proxy_fix_host_matching_with_prefix():
+    """ProxyFix adjusts both host and script prefix. Match and build both
+    use the proxy-rewritten values consistently."""
+
+    url_map = Map(
+        [
+            Rule("/", host="app.example.com", endpoint="index"),
+            Rule("/items", host="app.example.com", endpoint="items"),
+        ],
+        host_matching=True,
+    )
+
+    @Request.application
+    def app(request):
+        urls = url_map.bind_to_environ(request.environ)
+
+        # Adapter should have the proxy-rewritten host and script
+        assert urls.server_name == "app.example.com"
+        assert urls.script_name == "/myapp/"
+
+        endpoint, _ = urls.match("/items")
+        assert endpoint == "items"
+
+        # Build should include the proxy prefix
+        assert urls.build("items") == "/myapp/items"
+        # External build should use the proxy-rewritten host
+        assert (
+            urls.build("items", force_external=True)
+            == "http://app.example.com/myapp/items"
+        )
+
+        return Response("ok")
+
+    app = ProxyFix(app, x_host=1, x_prefix=1)
+
+    environ = create_environ(
+        "/items",
+        base_url="http://internal.proxy",
+        environ_overrides={
+            "HTTP_X_FORWARDED_HOST": "app.example.com",
+            "HTTP_X_FORWARDED_PREFIX": "/myapp",
+        },
+    )
+
+    response = Client(app).open(Request(environ))
+    assert response.data == b"ok"

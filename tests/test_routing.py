@@ -1392,8 +1392,11 @@ class TestHostMatching(_Routing):
             {"domain": "personal.test", "page": 1},
         )
 
-    def test_disables_subdomain_matching(self) -> None:
-        assert not self.url_map.subdomain_matching
+    def test_host_matching_takes_priority(self) -> None:
+        # host_matching=True no longer forces subdomain_matching=False.
+        # But host_matching takes priority for matching.
+        assert self.url_map.host_matching
+        assert self.url_map.subdomain_matching
 
     def test_match_redirect_trailing_slash(self) -> None:
         with pytest.raises(r.RequestRedirect) as excinfo:
@@ -1420,6 +1423,172 @@ class TestHostMatching(_Routing):
             self._build("page", base_url="app.test", domain="personal.test")
             == "http://app.personal.test/page/"
         )
+
+
+class TestHostAndSubdomainMatching(_Routing):
+    """Test host_matching + subdomain_matching coexistence.
+
+    When both are enabled:
+    - match() uses full host (host_matching behavior)
+    - build() can produce relative URLs for the same host
+    - Subdomain is computed from server_name in bind_to_environ
+    """
+
+    @classmethod
+    def setup_class(cls) -> None:
+        cls.url_map = r.Map(
+            [
+                r.Rule("/", host="app.test", endpoint="index"),
+                r.Rule("/", host="<lang>.app.test", endpoint="lang"),
+                r.Rule("/about", host="app.test", endpoint="about"),
+            ],
+            host_matching=True,
+            subdomain_matching=True,
+        )
+
+    default_base_url = "http://app.test"
+    default_server_name = "app.test"
+
+    def test_both_flags_enabled(self) -> None:
+        assert self.url_map.host_matching
+        assert self.url_map.subdomain_matching
+
+    def test_match_uses_host(self) -> None:
+        """Matching uses the full host, not subdomain."""
+        assert self._match(base_url="app.test") == ("index", {})
+
+    def test_match_variable_host(self) -> None:
+        assert self._match(base_url="en.app.test") == ("lang", {"lang": "en"})
+
+    def test_no_match_wrong_host(self) -> None:
+        with pytest.warns(match="configured server name"):
+            with pytest.raises(NotFound):
+                self._match(base_url="other.test")
+
+    def test_subdomain_computed(self) -> None:
+        """Subdomain is extracted from host vs server_name."""
+        adapter = self._bind(base_url="en.app.test")
+        assert adapter.subdomain == "en"
+
+    def test_subdomain_empty_when_same_as_server(self) -> None:
+        adapter = self._bind(base_url="app.test")
+        assert adapter.subdomain == ""
+
+    def test_adapter_server_name_is_request_host(self) -> None:
+        """With host_matching, adapter.server_name is the request host."""
+        adapter = self._bind(base_url="en.app.test")
+        assert adapter.server_name == "en.app.test"
+
+    def test_build_same_host_relative(self) -> None:
+        """Building for the same host produces relative URL."""
+        assert self._build("index", base_url="app.test") == "/"
+
+    def test_build_different_host_absolute(self) -> None:
+        """Building for a different host produces absolute URL."""
+        with pytest.warns(match="configured server name"):
+            assert self._build("index", base_url="other.test") == "http://app.test/"
+
+    def test_build_variable_host_same(self) -> None:
+        """Building with same variable host returns relative URL."""
+        assert self._build("lang", base_url="en.app.test", lang="en") == "/"
+
+    def test_build_variable_host_different(self) -> None:
+        """Building with different variable host returns absolute URL."""
+        assert (
+            self._build("lang", base_url="en.app.test", lang="fr")
+            == "http://fr.app.test/"
+        )
+
+    def test_subdomain_not_used_for_matching(self) -> None:
+        """Even though subdomain is computed, matching uses full host."""
+        adapter = self._bind(base_url="en.app.test")
+        assert adapter.subdomain == "en"
+        # match uses host_matching → domain_part = server_name = "en.app.test"
+        endpoint, values = adapter.match("/")
+        assert endpoint == "lang"
+        assert values == {"lang": "en"}
+
+    def test_host_matching_without_subdomain_matching(self) -> None:
+        """When host_matching=True and subdomain_matching=False explicitly."""
+        url_map = r.Map(
+            [r.Rule("/", host="app.test", endpoint="index")],
+            host_matching=True,
+            subdomain_matching=False,
+        )
+        assert url_map.host_matching
+        assert not url_map.subdomain_matching
+
+        env = create_environ("/", base_url="http://app.test")
+        adapter = url_map.bind_to_environ(env)
+        assert adapter.subdomain == ""
+        assert adapter.match("/") == ("index", {})
+        assert adapter.build("index") == "/"
+
+
+class TestNormalizeServerName:
+    """Tests for _normalize_server_name helper."""
+
+    def test_lowercase(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert _normalize_server_name("Example.COM", "http") == "example.com"
+
+    def test_strip_http_port_80(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert _normalize_server_name("example.com:80", "http") == "example.com"
+
+    def test_strip_https_port_443(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert _normalize_server_name("example.com:443", "https") == "example.com"
+
+    def test_keep_non_standard_port(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert (
+            _normalize_server_name("example.com:8080", "http") == "example.com:8080"
+        )
+
+    def test_keep_wrong_standard_port(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        # Port 443 is not standard for http
+        assert (
+            _normalize_server_name("example.com:443", "http") == "example.com:443"
+        )
+        # Port 80 is not standard for https
+        assert _normalize_server_name("example.com:80", "https") == "example.com:80"
+
+    def test_idna_encoding(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert _normalize_server_name("münchen.de", "http") == "xn--mnchen-3ya.de"
+
+    def test_idna_with_port(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert (
+            _normalize_server_name("münchen.de:8080", "http")
+            == "xn--mnchen-3ya.de:8080"
+        )
+
+    def test_ws_scheme(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert _normalize_server_name("example.com:80", "ws") == "example.com"
+
+    def test_wss_scheme(self) -> None:
+        from werkzeug.routing.map import _normalize_server_name
+
+        assert _normalize_server_name("example.com:443", "wss") == "example.com"
+
+    def test_bad_host(self) -> None:
+        from werkzeug.exceptions import BadHost
+        from werkzeug.routing.map import _normalize_server_name
+
+        with pytest.raises(BadHost):
+            _normalize_server_name("-invalid..host-", "http")
 
 
 class TestNoDomainMatching(_Routing):

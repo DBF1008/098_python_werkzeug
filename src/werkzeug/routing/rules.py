@@ -699,10 +699,12 @@ class Rule(RuleFactory):
         """Compiles the regular expression and stores it."""
         assert self.map is not None, "rule not bound"
 
-        if self.map.subdomain_matching:
+        if self.map.host_matching:
+            domain_rule = self.host
+        elif self.map.subdomain_matching:
             domain_rule = self.subdomain
         else:
-            domain_rule = self.host
+            domain_rule = None
         self._parts = []
         self._trace = []
         self._converters = {}
