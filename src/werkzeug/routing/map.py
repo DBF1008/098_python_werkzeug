@@ -327,12 +327,16 @@ class Map:
             Removed the ``calculate_subdomain`` parameter which was not used.
         """
         if isinstance(environ, Request):
-            # accessing request.host triggers trusted_hosts validation
-            wsgi_server_name = environ.host.lower()
+            # Access request.host to trigger trusted_hosts validation.
+            # Don't use the return value for wsgi_server_name because
+            # request.scheme is frozen at init time and may be stale if
+            # ProxyFix modified wsgi.url_scheme after Request creation.
+            environ.host
             env = environ.environ
         else:
-            wsgi_server_name = get_host(environ).lower()
             env = environ
+
+        wsgi_server_name = get_host(env).lower()
 
         scheme = env["wsgi.url_scheme"]
         upgrade = any(
@@ -348,11 +352,12 @@ class Map:
         else:
             server_name = server_name.lower()
 
-            # strip standard port to match get_host()
-            if scheme in {"http", "ws"} and server_name.endswith(":80"):
-                server_name = server_name[:-3]
-            elif scheme in {"https", "wss"} and server_name.endswith(":443"):
-                server_name = server_name[:-4]
+        # Strip the default port for the scheme so that server_name
+        # matches the format produced by get_host().
+        if scheme in {"http", "ws"} and server_name.endswith(":80"):
+            server_name = server_name[:-3]
+        elif scheme in {"https", "wss"} and server_name.endswith(":443"):
+            server_name = server_name[:-4]
 
         if subdomain is None and self.subdomain_matching:
             cur_server_name = wsgi_server_name.split(".")

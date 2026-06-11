@@ -1689,6 +1689,146 @@ def test_build_url_same_endpoint_multiple_hosts():
     assert beta_case.build("index") == "/"
 
 
+def test_bind_to_environ_request_after_proxy_fix_host_matching():
+    """When a Request is passed to bind_to_environ and the environ was
+    modified after the Request was created (as ProxyFix does), use the
+    live environ values for scheme and host, not the stale Request
+    properties. With host_matching, match and build must agree.
+    """
+    m = r.Map(
+        [r.Rule("/", endpoint="index", host="example.com")],
+        host_matching=True,
+    )
+    env = create_environ("/", "http://example.com:443/")
+    req = Request(env)
+    # Simulate ProxyFix modifying environ after Request creation.
+    env["wsgi.url_scheme"] = "https"
+    env["HTTP_HOST"] = "example.com"
+    env["SERVER_NAME"] = "example.com"
+    env["SERVER_PORT"] = "443"
+
+    adapter = m.bind_to_environ(req)
+    assert adapter.server_name == "example.com"
+    assert adapter.url_scheme == "https"
+    assert adapter.match("/") == ("index", {})
+    assert adapter.build("index") == "/"
+
+
+def test_bind_to_environ_request_after_proxy_fix_subdomain():
+    """ProxyFix + Request + subdomain_matching: the live environ scheme
+    is used for port stripping, not the stale Request scheme.
+    """
+    m = r.Map(
+        [
+            r.Rule("/", endpoint="main"),
+            r.Rule("/", subdomain="api", endpoint="api"),
+        ]
+    )
+    env = create_environ("/", "http://api.example.com:443/")
+    req = Request(env)
+    # Simulate ProxyFix
+    env["wsgi.url_scheme"] = "https"
+    env["HTTP_HOST"] = "api.example.com"
+    env["SERVER_NAME"] = "api.example.com"
+    env["SERVER_PORT"] = "443"
+
+    adapter = m.bind_to_environ(req, server_name="example.com")
+    assert adapter.subdomain == "api"
+    assert adapter.match("/") == ("api", {})
+    assert adapter.build("api") == "/"
+    assert adapter.build("main") == "https://example.com/"
+
+
+def test_proxy_fix_host_matching_script_name():
+    """ProxyFix X-Forwarded-Prefix + host_matching: script_name from
+    proxy propagates consistently to both match redirects and build.
+    """
+    m = r.Map(
+        [
+            r.Rule("/", endpoint="index", host="example.com"),
+            r.Rule("/api/", endpoint="api", host="example.com"),
+            r.Rule("/other", endpoint="other", host="other.example.com"),
+        ],
+        host_matching=True,
+    )
+    env = create_environ("/api", "https://example.com/")
+    # Simulate ProxyFix setting X-Forwarded-Prefix
+    env["SCRIPT_NAME"] = "/prefix"
+
+    adapter = m.bind_to_environ(env)
+    # build should use the proxied script_name
+    assert adapter.build("index") == "/prefix/"
+    assert adapter.build("other") == "https://other.example.com/prefix/other"
+
+    # match redirect for trailing slash should include script_name
+    with pytest.raises(r.RequestRedirect) as exc:
+        adapter.match("/api")
+    assert "/prefix/api/" in exc.value.new_url
+
+
+def test_rule_host_case_normalization():
+    """Rule.host is lowered when bound so it matches the lowered
+    server_name from Map.bind(). match and build both work.
+    """
+    m = r.Map(
+        [
+            r.Rule("/", endpoint="index", host="Example.Com"),
+            r.Rule("/other", endpoint="other", host="OTHER.example.com"),
+        ],
+        host_matching=True,
+    )
+    adapter = m.bind("example.com")
+    assert adapter.match("/") == ("index", {})
+    assert adapter.build("index") == "/"
+
+    adapter2 = m.bind("other.example.com")
+    assert adapter2.match("/other") == ("other", {})
+    assert adapter2.build("other") == "/other"
+
+    # Cross-host build produces absolute URL with lowered host
+    assert adapter.build("other") == "http://other.example.com/other"
+
+
+def test_rule_subdomain_case_normalization():
+    """Rule.subdomain is lowered when bound so it matches the lowered
+    subdomain extracted from the request host.
+    """
+    m = r.Map(
+        [
+            r.Rule("/", endpoint="main"),
+            r.Rule("/", subdomain="API", endpoint="api"),
+        ]
+    )
+    env = create_environ("/", "http://api.example.com/")
+    adapter = m.bind_to_environ(env, server_name="example.com")
+    assert adapter.match("/") == ("api", {})
+    assert adapter.build("api") == "/"
+    assert adapter.build("main") == "http://example.com/"
+
+
+def test_port_stripping_with_proxy_scheme_change():
+    """Standard ports are stripped based on the current scheme, even
+    when the scheme was changed by middleware like ProxyFix.
+    """
+    m = r.Map([r.Rule("/", endpoint="index")])
+
+    # https with port 443 → strip
+    env = create_environ("/", "http://example.com:443/")
+    env["wsgi.url_scheme"] = "https"
+    adapter = m.bind_to_environ(env)
+    assert adapter.server_name == "example.com"
+
+    # http with port 80 → strip
+    env2 = create_environ("/", "http://example.com:80/")
+    adapter2 = m.bind_to_environ(env2)
+    assert adapter2.server_name == "example.com"
+
+    # Explicit server_name with standard port also stripped
+    env3 = create_environ("/", "http://sub.example.com/")
+    adapter3 = m.bind_to_environ(env3, server_name="example.com:80")
+    assert "80" not in adapter3.server_name
+
+
 def test_rule_websocket_methods():
     with pytest.raises(ValueError):
         r.Rule("/ws", endpoint="ws", websocket=True, methods=["post"])

@@ -577,6 +577,15 @@ class Rule(RuleFactory):
             self.merge_slashes = map.merge_slashes
         if self.subdomain is None:
             self.subdomain = map.default_subdomain
+
+        # DNS names are case-insensitive. Normalize to lowercase so that
+        # the compiled matcher patterns and builder output are consistent
+        # with MapAdapter.server_name (lowered in Map.bind).
+        if self.host is not None:
+            self.host = self.host.lower()
+        if self.subdomain is not None:
+            self.subdomain = self.subdomain.lower()
+
         self.compile()
 
     def get_converter(
