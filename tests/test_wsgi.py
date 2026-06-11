@@ -338,3 +338,95 @@ def test_closing_iterator():
     assert "".join(app_iter) == "some content"
     assert Namespace.got_close
     assert Namespace.got_additional
+
+
+def test_closing_iterator_idempotent():
+    """ClosingIterator.close() must only fire callbacks once even if called
+    multiple times (e.g. when nested in a wrapping chain)."""
+    call_count = 0
+
+    def callback():
+        nonlocal call_count
+        call_count += 1
+
+    ci = ClosingIterator(iter([b"data"]), callback)
+    ci.close()
+    ci.close()
+    ci.close()
+    assert call_count == 1
+
+
+def test_closing_iterator_nested_wrapping():
+    """When ClosingIterator wraps another ClosingIterator, close must
+    propagate through the chain and each callback fires exactly once."""
+    inner_calls = []
+    outer_calls = []
+
+    class Iterable:
+        def __iter__(self):
+            yield b"chunk"
+
+        def close(self):
+            inner_calls.append("iterable_close")
+
+    def outer_callback():
+        outer_calls.append("outer")
+
+    inner = ClosingIterator(Iterable(), lambda: inner_calls.append("inner"))
+    outer = ClosingIterator(inner, outer_callback)
+
+    # Consume the iterable
+    list(outer)
+    # Close once (simulating WSGI server)
+    outer.close()
+    # Also simulate a second close call (e.g. from middleware)
+    outer.close()
+
+    assert inner_calls == ["iterable_close", "inner"]
+    assert outer_calls == ["outer"]
+
+
+def test_file_wrapper_close_idempotent():
+    """FileWrapper.close() must be safe to call multiple times."""
+    from werkzeug.wsgi import FileWrapper
+
+    close_count = 0
+
+    class FakeFile:
+        def read(self, size):
+            return b""
+
+        def close(self):
+            nonlocal close_count
+            close_count += 1
+
+    fw = FileWrapper(FakeFile())
+    fw.close()
+    fw.close()
+    assert close_count == 1
+
+
+def test_range_wrapper_close_idempotent():
+    """_RangeWrapper.close() must be safe to call multiple times."""
+    close_count = 0
+
+    class Iterator:
+        def __init__(self):
+            self._data = [b"some data"]
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._data:
+                return self._data.pop(0)
+            raise StopIteration
+
+        def close(self):
+            nonlocal close_count
+            close_count += 1
+
+    rw = _RangeWrapper(Iterator(), 0, 4)
+    rw.close()
+    rw.close()
+    assert close_count == 1

@@ -166,6 +166,7 @@ class Response(_SansIOResponse):
         #: manually.
         self.direct_passthrough = direct_passthrough
         self._on_close: list[t.Callable[[], t.Any]] = []
+        self._closed = False
 
         # we set the response after the headers so that if a class changes
         # the charset attribute, the data is set in the correct charset.
@@ -353,7 +354,7 @@ class Response(_SansIOResponse):
             close = getattr(self.response, "close", None)
             self.response = list(self.iter_encoded())
             if close is not None:
-                self.call_on_close(close)
+                close()
 
     def iter_encoded(self) -> t.Iterator[bytes]:
         """Iter the response encoded with the encoding of the response.
@@ -399,6 +400,9 @@ class Response(_SansIOResponse):
         .. versionadded:: 0.9
            Can now be used in a with statement.
         """
+        if self._closed:
+            return
+        self._closed = True
         if hasattr(self.response, "close"):
             self.response.close()
         for func in self._on_close:
@@ -532,12 +536,22 @@ class Response(_SansIOResponse):
         :return: a response iterable.
         """
         status = self.status_code
-        if (
+        is_empty_response = (
             environ["REQUEST_METHOD"] == "HEAD"
             or 100 <= status < 200
             or status in (204, 304)
-        ):
+        )
+        if is_empty_response:
             iterable: t.Iterable[bytes] = ()
+            # HEAD/204/304: the body is not iterated, but its close must
+            # still fire at the ClosingIterator layer (symmetric with GET
+            # where the iterable's own close is captured by ClosingIterator).
+            body_close = getattr(self.response, "close", None)
+            callbacks: list[t.Callable[[], t.Any]] = []
+            if body_close is not None:
+                callbacks.append(body_close)
+            callbacks.append(self.close)
+            return ClosingIterator(iterable, callbacks)
         elif self.direct_passthrough:
             return self.response  # type: ignore
         else:

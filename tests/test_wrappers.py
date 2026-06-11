@@ -26,6 +26,7 @@ from werkzeug.http import generate_etag
 from werkzeug.test import Client
 from werkzeug.test import create_environ
 from werkzeug.test import run_wsgi_app
+from werkzeug.wsgi import ClosingIterator
 from werkzeug.wsgi import LimitedStream
 from werkzeug.wsgi import wrap_file
 
@@ -1313,3 +1314,160 @@ def test_response_coep():
     assert response.cross_origin_embedder_policy is COEP.UNSAFE_NONE
     response.cross_origin_embedder_policy = COEP.REQUIRE_CORP
     assert response.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
+
+
+def test_head_streaming_close_order():
+    """HEAD request with a streaming (generator) body: the body generator is
+    never started (per HTTP spec), so its finally block won't fire on close
+    (Python behavior for unstarted generators).  However, _on_close callbacks
+    must fire exactly once and in order."""
+    events = []
+
+    def body():
+        try:
+            yield b"chunk1"
+            yield b"chunk2"
+        finally:
+            events.append("body_finally")
+
+    response = wrappers.Response(body())
+    response.call_on_close(lambda: events.append("on_close_1"))
+    response.call_on_close(lambda: events.append("on_close_2"))
+
+    environ = create_environ(method="HEAD")
+    app_iter = response(environ, lambda s, h: None)
+
+    # Simulate WSGI server: consume iterator then close
+    list(app_iter)
+    app_iter.close()
+
+    # body_finally does NOT fire because the generator was never started
+    # (Python: closing an unstarted generator doesn't run finally blocks).
+    # _on_close callbacks DO fire exactly once.
+    assert events == ["on_close_1", "on_close_2"]
+
+    # Verify idempotency: second close does nothing
+    app_iter.close()
+    assert events == ["on_close_1", "on_close_2"]
+
+
+def test_head_started_streaming_close_order():
+    """HEAD request where the body is a started iterator with a close method:
+    the close fires because the iterator was already started.  Note that
+    the body's close may be called twice (once by ClosingIterator, once by
+    Response.close) — close must be idempotent (like generator.close)."""
+    events = []
+
+    class StartedIterator:
+        def __init__(self):
+            self._closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            if not self._closed:
+                self._closed = True
+                events.append("iterator_close")
+
+    response = wrappers.Response(StartedIterator())
+    response.call_on_close(lambda: events.append("on_close"))
+
+    environ = create_environ(method="HEAD")
+    app_iter = response(environ, lambda s, h: None)
+    list(app_iter)
+    app_iter.close()
+
+    # iterator_close fires (body had close method and was directly registered)
+    # on_close fires via Response.close (idempotent body close is a no-op)
+    assert events == ["iterator_close", "on_close"]
+
+
+def test_head_streaming_middleware_wrapping():
+    """HEAD request with streaming body wrapped by middleware ClosingIterator:
+    the body generator is never started (its finally won't fire), but _on_close
+    and middleware callbacks must fire exactly once even on double close."""
+    events = []
+
+    def body():
+        try:
+            yield b"data"
+        finally:
+            events.append("body_finally")
+
+    def middleware(app):
+        def application(environ, start_response):
+            return ClosingIterator(
+                app(environ, start_response),
+                lambda: events.append("middleware_cleanup"),
+            )
+
+        return application
+
+    response = wrappers.Response(body())
+    response.call_on_close(lambda: events.append("on_close"))
+
+    app = middleware(lambda environ, start_response: response(environ, start_response))
+
+    environ = create_environ(method="HEAD")
+    app_iter = app(environ, lambda s, h: None)
+
+    # Simulate WSGI server
+    list(app_iter)
+    app_iter.close()
+    # Simulate second close (from another middleware layer)
+    app_iter.close()
+
+    # body_finally doesn't fire (unstarted generator).
+    # All other callbacks fire exactly once, in correct order.
+    assert events == ["on_close", "middleware_cleanup"]
+
+
+def test_response_close_idempotent():
+    """Response.close() must only fire callbacks once even if called
+    multiple times."""
+    events = []
+
+    class Iterable:
+        def __next__(self):
+            raise StopIteration()
+
+        def __iter__(self):
+            return self
+
+        def close(self):
+            events.append("iterable_close")
+
+    response = wrappers.Response(Iterable())
+    response.call_on_close(lambda: events.append("on_close"))
+    response.close()
+    response.close()
+    response.close()
+    # Each callback fires exactly once
+    assert events == ["iterable_close", "on_close"]
+
+
+def test_make_sequence_closes_consumed():
+    """make_sequence() must close the consumed iterable immediately,
+    not defer it to Response.close()."""
+    closed = []
+
+    class Iterable:
+        def __iter__(self):
+            yield b"chunk"
+
+        def close(self):
+            closed.append(True)
+
+    response = wrappers.Response(Iterable())
+    assert not closed
+    response.make_sequence()
+    # close fires immediately after consuming
+    assert closed == [True]
+    # Response.close() is safe to call afterwards (idempotent)
+    response.close()
+    # No second close call on the consumed iterable
+    assert closed == [True]

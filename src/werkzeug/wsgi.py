@@ -262,6 +262,7 @@ class ClosingIterator:
         if iterable_close:
             callbacks.insert(0, iterable_close)
         self._callbacks = callbacks
+        self._closed = False
 
     def __iter__(self) -> ClosingIterator:
         return self
@@ -270,6 +271,9 @@ class ClosingIterator:
         return self._next()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         for callback in self._callbacks:
             callback()
 
@@ -318,8 +322,12 @@ class FileWrapper:
     def __init__(self, file: t.IO[bytes], buffer_size: int = 8192) -> None:
         self.file = file
         self.buffer_size = buffer_size
+        self._closed = False
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if hasattr(self.file, "close"):
             self.file.close()
 
@@ -383,6 +391,7 @@ class _RangeWrapper:
         self.read_length = 0
         self.seekable = hasattr(iterable, "seekable") and iterable.seekable()
         self.end_reached = False
+        self._closed = False
 
     def __iter__(self) -> _RangeWrapper:
         return self
@@ -432,6 +441,9 @@ class _RangeWrapper:
         raise StopIteration()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if hasattr(self.iterable, "close"):
             self.iterable.close()
 
