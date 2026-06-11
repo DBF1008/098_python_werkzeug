@@ -399,10 +399,20 @@ class Response(_SansIOResponse):
         .. versionadded:: 0.9
            Can now be used in a with statement.
         """
-        if hasattr(self.response, "close"):
-            self.response.close()
+        first_exception = None
+        try:
+            if hasattr(self.response, "close"):
+                self.response.close()
+        except Exception as e:
+            first_exception = e
         for func in self._on_close:
-            func()
+            try:
+                func()
+            except Exception as e:
+                if first_exception is None:
+                    first_exception = e
+        if first_exception is not None:
+            raise first_exception
 
     def __enter__(self) -> Response:
         return self
@@ -539,7 +549,7 @@ class Response(_SansIOResponse):
         ):
             iterable: t.Iterable[bytes] = ()
         elif self.direct_passthrough:
-            return self.response  # type: ignore
+            return ClosingIterator(self.response, self._on_close)  # type: ignore
         else:
             iterable = self.iter_encoded()
         return ClosingIterator(iterable, self.close)

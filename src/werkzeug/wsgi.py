@@ -270,8 +270,15 @@ class ClosingIterator:
         return self._next()
 
     def close(self) -> None:
+        first_exception = None
         for callback in self._callbacks:
-            callback()
+            try:
+                callback()
+            except Exception as e:
+                if first_exception is None:
+                    first_exception = e
+        if first_exception is not None:
+            raise first_exception
 
 
 def wrap_file(
@@ -372,6 +379,7 @@ class _RangeWrapper:
         start_byte: int = 0,
         byte_range: int | None = None,
     ):
+        self._original_iterable = iterable
         self.iterable = iter(iterable)
         self.byte_range = byte_range
         self.start_byte = start_byte
@@ -432,8 +440,8 @@ class _RangeWrapper:
         raise StopIteration()
 
     def close(self) -> None:
-        if hasattr(self.iterable, "close"):
-            self.iterable.close()
+        if hasattr(self._original_iterable, "close"):
+            self._original_iterable.close()
 
 
 class LimitedStream(io.RawIOBase):

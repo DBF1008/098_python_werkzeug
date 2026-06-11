@@ -338,3 +338,56 @@ def test_closing_iterator():
     assert "".join(app_iter) == "some content"
     assert Namespace.got_close
     assert Namespace.got_additional
+
+
+def test_closing_iterator_exception_safety():
+    called = []
+
+    def cb_ok1():
+        called.append("ok1")
+
+    def cb_fail():
+        called.append("fail")
+        raise RuntimeError("callback failed")
+
+    def cb_ok2():
+        called.append("ok2")
+
+    it = ClosingIterator(iter([]), [cb_ok1, cb_fail, cb_ok2])
+    with pytest.raises(RuntimeError, match="callback failed"):
+        it.close()
+    assert called == ["ok1", "fail", "ok2"]
+
+
+def test_range_wrapper_close():
+    closed = []
+
+    class IterWithSeparateIterator:
+        def __iter__(self):
+            yield b"abcdefgh"
+
+        def close(self):
+            closed.append(True)
+
+    wrapper = _RangeWrapper(IterWithSeparateIterator(), 0, 4)
+    wrapper.close()
+    assert len(closed) == 1
+
+
+def test_closing_iterator_nested():
+    calls = []
+
+    class Inner:
+        def __iter__(self):
+            yield b"x"
+
+        def close(self):
+            calls.append("inner_iter")
+
+    inner = ClosingIterator(Inner(), lambda: calls.append("inner_cb"))
+    outer = ClosingIterator(inner, lambda: calls.append("outer_cb"))
+    list(outer)
+    outer.close()
+    assert "inner_iter" in calls
+    assert "inner_cb" in calls
+    assert "outer_cb" in calls

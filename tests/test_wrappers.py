@@ -298,6 +298,87 @@ def test_base_response():
     assert len(closed) == 1
 
 
+def test_direct_passthrough_close():
+    closed = []
+
+    class CloseableIter:
+        def __iter__(self):
+            yield b"data"
+
+        def close(self):
+            closed.append("iter")
+
+    response = wrappers.Response(CloseableIter(), direct_passthrough=True)
+    response.call_on_close(lambda: closed.append("on_close"))
+    app_iter, status, headers = run_wsgi_app(response, create_environ(), buffered=True)
+    assert b"".join(app_iter) == b"data"
+    assert "iter" in closed
+    assert "on_close" in closed
+
+
+def test_head_request_close():
+    closed = []
+
+    class CloseableIter:
+        def __iter__(self):
+            yield b"body"
+
+        def close(self):
+            closed.append("iter")
+
+    response = wrappers.Response(CloseableIter())
+    response.call_on_close(lambda: closed.append("on_close"))
+    environ = create_environ(method="HEAD")
+    app_iter, status, headers = run_wsgi_app(response, environ, buffered=True)
+    assert b"".join(app_iter) == b""
+    assert "iter" in closed
+    assert "on_close" in closed
+
+
+def test_close_exception_safety():
+    closed = []
+
+    class FailIter:
+        def __iter__(self):
+            return iter([])
+
+        def close(self):
+            raise RuntimeError("close failed")
+
+    response = wrappers.Response(FailIter())
+    response.call_on_close(lambda: closed.append("cb1"))
+    response.call_on_close(lambda: closed.append("cb2"))
+    with pytest.raises(RuntimeError, match="close failed"):
+        response.close()
+    assert closed == ["cb1", "cb2"]
+
+
+def test_close_ordering():
+    order = []
+
+    class CloseableIter:
+        def __iter__(self):
+            return iter([])
+
+        def close(self):
+            order.append("iter")
+
+    response = wrappers.Response(CloseableIter())
+    response.call_on_close(lambda: order.append("cb1"))
+    response.call_on_close(lambda: order.append("cb2"))
+    response.close()
+    assert order == ["iter", "cb1", "cb2"]
+
+
+def test_non_streaming_close_unchanged():
+    closed = []
+    response = wrappers.Response("Hello World")
+    response.call_on_close(lambda: closed.append(True))
+    app_iter, status, headers = run_wsgi_app(response, create_environ(), buffered=True)
+    assert b"".join(app_iter) == b"Hello World"
+    assert len(closed) == 1
+
+
 @pytest.mark.parametrize(
     ("status_code", "expected_status"),
     [
